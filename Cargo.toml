@@ -1,0 +1,37 @@
+[package]
+name = "anvir-next"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Lightweight native Windows tray and process monitor"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Ole", "Win32_System_TaskScheduler", "Win32_System_Variant", "Win32_UI_Shell", "Win32_System_Com_StructuredStorage"] }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_Storage_FileSystem",
+    "Win32_System_ProcessStatus", "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Memory",
+    "Win32_System_Performance", "Win32_System_Registry", "Win32_System_SystemInformation",
+    "Win32_System_Threading", "Win32_System_Kernel", "Win32_NetworkManagement_IpHelper",
+    "Wdk_System_SystemInformation", "Wdk_System_Threading", "Win32_System_Services",
+    "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock",
+    "Win32_Graphics_Gdi", "Win32_UI_Controls", "Win32_UI_HiDpi",
+    "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"
+] }
+
+[build-dependencies]
+embed-resource = "3.0.12"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"

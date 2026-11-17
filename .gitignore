@@ -1,0 +1,7 @@
+/target/
+/dist/
+/vendor/
+/work/
+/.superpowers/
+/.impeccable/review/
+*.user
