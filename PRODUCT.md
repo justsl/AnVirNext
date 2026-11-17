@@ -8,7 +8,7 @@ Native Windows desktop, Windows 11 x64 first.
 
 ## Stack
 
-Rust and native Win32 controls. The user is installing Rust. Use the official LibreHardwareMonitor library for hardware sensors; keep its .NET dependency outside the native UI.
+Rust and native Win32 controls. Use the official LibreHardwareMonitor library for hardware sensors; keep its .NET dependency outside the native UI.
 
 ## Users and purpose
 

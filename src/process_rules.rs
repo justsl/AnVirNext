@@ -8,7 +8,11 @@ use std::{
     io,
     path::{Component, Path, PathBuf, Prefix},
 };
-use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
+use windows_sys::Win32::{
+    Foundation::FILETIME,
+    Globalization::{CSTR_EQUAL, CompareStringOrdinal},
+    System::SystemInformation::GetSystemTimePreciseAsFileTime,
+};
 
 const MAX_RULES: usize = 128;
 const MAX_FILE: usize = 128 * 1024;
@@ -21,6 +25,13 @@ pub struct ProcessRule {
     pub priority: u32,
     pub affinity: u64,
 }
+#[derive(Serialize, Deserialize)]
+struct StoredRule {
+    #[serde(flatten)]
+    rule: ProcessRule,
+    #[serde(default)]
+    activated_after: Option<u64>,
+}
 struct Attempt {
     rule_id: u64,
     count: u8,
@@ -31,23 +42,37 @@ pub struct RuleBook {
     rules: Vec<ProcessRule>,
     rule_paths: Vec<Vec<u16>>,
     rule_ids: Vec<u64>,
+    activations: Vec<u64>,
     next_id: u64,
     attempts: HashMap<(u32, u64), Attempt>,
 }
 impl RuleBook {
     pub fn load(path: &Path) -> Result<Self, String> {
+        // Legacy arrays lack an eligibility boundary. Exclude existing processes
+        // using this runtime baseline, without writing during a read-only load.
+        let legacy_baseline = activation_time();
         let bytes = match read_bounded(path, MAX_FILE) {
             Ok(bytes) => Some(bytes),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(format!("Read process rules: {error}")),
         };
-        let mut rules: Vec<ProcessRule> = match bytes {
+        let stored: Vec<StoredRule> = match bytes {
             Some(bytes) => serde_json::from_slice(&bytes)
                 .map_err(|error| format!("Invalid process rules: {error}"))?,
             None => Vec::new(),
         };
-        if rules.len() > MAX_RULES {
+        if stored.len() > MAX_RULES {
             return Err("At most 128 process rules are supported".into());
+        }
+        let mut rules = Vec::with_capacity(stored.len());
+        let mut activations = Vec::with_capacity(stored.len());
+        for entry in stored {
+            let activation = entry.activated_after.unwrap_or(legacy_baseline);
+            if activation == 0 {
+                return Err("Invalid process rule activation time".into());
+            }
+            rules.push(entry.rule);
+            activations.push(activation);
         }
         for index in 0..rules.len() {
             validate_rule(&mut rules[index])?;
@@ -68,6 +93,7 @@ impl RuleBook {
             rules,
             rule_paths,
             rule_ids: (1..=count).collect(),
+            activations,
             next_id: count + 1,
             attempts: HashMap::new(),
         })
@@ -89,11 +115,19 @@ impl RuleBook {
             .checked_add(1)
             .ok_or("Process rule revision limit reached")?;
         let mut rules = self.rules.clone();
+        let mut activations = self.activations.clone();
+        let activation = activation_time();
         match index {
-            Some(index) => rules[index] = rule,
-            None => rules.push(rule),
+            Some(index) => {
+                rules[index] = rule;
+                activations[index] = activation;
+            }
+            None => {
+                rules.push(rule);
+                activations.push(activation);
+            }
         }
-        self.persist(&rules)?;
+        self.persist(&rules, &activations)?;
         match index {
             Some(index) => self.rule_ids[index] = self.next_id,
             None => self.rule_ids.push(self.next_id),
@@ -104,6 +138,7 @@ impl RuleBook {
             .map(|rule| rule.executable.encode_utf16().collect())
             .collect();
         self.rules = rules;
+        self.activations = activations;
         Ok(())
     }
     pub fn remove(&mut self, executable: &str) -> Result<(), String> {
@@ -116,9 +151,12 @@ impl RuleBook {
             return Ok(());
         };
         let mut rules = self.rules.clone();
+        let mut activations = self.activations.clone();
         rules.remove(index);
-        self.persist(&rules)?;
+        activations.remove(index);
+        self.persist(&rules, &activations)?;
         self.rules = rules;
+        self.activations = activations;
         self.rule_paths.remove(index);
         let id = self.rule_ids.remove(index);
         self.attempts.retain(|_, attempt| attempt.rule_id != id);
@@ -127,8 +165,16 @@ impl RuleBook {
     pub fn has_rules(&self) -> bool {
         !self.rules.is_empty()
     }
-    fn persist(&self, rules: &[ProcessRule]) -> Result<(), String> {
-        let bytes = serde_json::to_vec_pretty(rules).map_err(|error| error.to_string())?;
+    fn persist(&self, rules: &[ProcessRule], activations: &[u64]) -> Result<(), String> {
+        let stored: Vec<_> = rules
+            .iter()
+            .zip(activations)
+            .map(|(rule, activation)| StoredRule {
+                rule: rule.clone(),
+                activated_after: Some(*activation),
+            })
+            .collect();
+        let bytes = serde_json::to_vec_pretty(&stored).map_err(|error| error.to_string())?;
         if bytes.len() > MAX_FILE {
             return Err("Process rules exceed 128 KiB limit".into());
         }
@@ -166,6 +212,11 @@ impl RuleBook {
             else {
                 continue;
             };
+            // Creation identity is stable across samples/reloads. A rule edit
+            // advances this boundary instead of changing already-running siblings.
+            if times.created <= self.activations[index] {
+                continue;
+            }
             let id = self.rule_ids[index];
             let attempt = self.attempts.entry(identity).or_insert(Attempt {
                 rule_id: id,
@@ -194,6 +245,15 @@ impl RuleBook {
         }
         errors
     }
+}
+
+fn activation_time() -> u64 {
+    let mut now = FILETIME::default();
+    // SAFETY: one writable FILETIME output; available on the Windows 11 target.
+    unsafe {
+        GetSystemTimePreciseAsFileTime(&mut now);
+    }
+    crate::win::filetime(now)
 }
 
 fn validate_rule(rule: &mut ProcessRule) -> Result<(), String> {
@@ -391,6 +451,9 @@ mod tests {
             affinity: 0,
         })
         .unwrap();
+        // A future identity that safely fails self/identity validation exercises
+        // retry bookkeeping without changing any live process.
+        row.times.as_mut().unwrap().created = u64::MAX - 1;
         for _ in 0..3 {
             assert_eq!(book.apply_new(&[row.clone()]).len(), 1);
         }
@@ -405,35 +468,17 @@ mod tests {
 
     #[test]
     fn successful_rule_is_applied_once_to_a_controlled_child() {
-        struct Child(std::process::Child);
-        impl Drop for Child {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
-        }
-        let child = Child(
-            std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--ignored", "--exact", "processes::tests::controlled_child"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .unwrap(),
-        );
-        let row = crate::processes::ProcessSampler::default()
-            .sample(1)
-            .into_iter()
-            .find(|row| row.pid == child.0.id())
-            .unwrap();
-        let created = row.times.unwrap().created;
         let temp = Temporary::new();
         let mut book = RuleBook::load(&temp.path()).unwrap();
         book.upsert(ProcessRule {
-            executable: row.path.clone(),
+            executable: std::env::current_exe().unwrap().to_str().unwrap().into(),
             priority: 0x4000,
             affinity: 0,
         })
         .unwrap();
+        let child = ControlledChild::new();
+        let row = child.row();
+        let created = row.times.unwrap().created;
         assert!(book.apply_new(std::slice::from_ref(&row)).is_empty());
         assert_eq!(
             crate::processes::details(row.pid, created)
@@ -449,5 +494,184 @@ mod tests {
                 .priority,
             0x20
         );
+    }
+
+    struct ControlledChild(std::process::Child);
+    impl ControlledChild {
+        fn new() -> Self {
+            Self(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--ignored", "--exact", "processes::tests::controlled_child"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            )
+        }
+        fn row(&self) -> ProcessRow {
+            crate::processes::ProcessSampler::default()
+                .sample(1)
+                .into_iter()
+                .find(|row| row.pid == self.0.id())
+                .unwrap()
+        }
+    }
+    impl Drop for ControlledChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    fn priority(row: &ProcessRow) -> u32 {
+        crate::processes::details(row.pid, row.times.unwrap().created)
+            .unwrap()
+            .priority
+    }
+
+    #[test]
+    fn saved_and_edited_rules_exclude_old_siblings_and_preserve_cutoff_after_reload() {
+        let selected = ControlledChild::new();
+        let sibling = ControlledChild::new();
+        let selected_row = selected.row();
+        let sibling_row = sibling.row();
+        let sibling_priority = priority(&sibling_row);
+        let temp = Temporary::new();
+        let mut book = RuleBook::load(&temp.path()).unwrap();
+        set_scheduling(
+            selected_row.pid,
+            selected_row.times.unwrap().created,
+            0x4000,
+            0,
+        )
+        .unwrap();
+        book.upsert(ProcessRule {
+            executable: selected_row.path.clone(),
+            priority: 0x4000,
+            affinity: 0,
+        })
+        .unwrap();
+        let mut rows = vec![selected_row.clone(), sibling_row.clone()];
+        assert!(book.apply_new(&rows).is_empty());
+        assert_eq!(priority(&selected_row), 0x4000);
+        assert_eq!(
+            priority(&sibling_row),
+            sibling_priority,
+            "saving a future-launch rule changed an unselected old sibling"
+        );
+
+        let future = ControlledChild::new();
+        let future_row = future.row();
+        rows.push(future_row.clone());
+        assert!(book.apply_new(&rows).is_empty());
+        assert_eq!(priority(&future_row), 0x4000);
+        set_scheduling(future_row.pid, future_row.times.unwrap().created, 0x20, 0).unwrap();
+        set_scheduling(
+            selected_row.pid,
+            selected_row.times.unwrap().created,
+            0x40,
+            0,
+        )
+        .unwrap();
+        book.upsert(ProcessRule {
+            executable: selected_row.path.clone(),
+            priority: 0x40,
+            affinity: 0,
+        })
+        .unwrap();
+        assert!(book.apply_new(&rows).is_empty());
+        assert_eq!(priority(&selected_row), 0x40);
+        assert_eq!(priority(&sibling_row), sibling_priority);
+        assert_eq!(
+            priority(&future_row),
+            0x20,
+            "editing a rule changed an already-running instance"
+        );
+
+        let newest = ControlledChild::new();
+        let newest_row = newest.row();
+        rows.push(newest_row.clone());
+        let mut loaded = RuleBook::load(&temp.path()).unwrap();
+        assert!(loaded.apply_new(&rows).is_empty());
+        assert_eq!(priority(&sibling_row), sibling_priority);
+        assert_eq!(
+            priority(&future_row),
+            0x20,
+            "reload lost the edited rule's activation cutoff"
+        );
+        assert_eq!(priority(&newest_row), 0x40);
+    }
+
+    #[test]
+    fn legacy_rules_exclude_existing_instances_without_writing_on_load() {
+        let old = ControlledChild::new();
+        let old_row = old.row();
+        let old_priority = priority(&old_row);
+        let temp = Temporary::new();
+        let legacy = serde_json::to_vec(&[ProcessRule {
+            executable: old_row.path.clone(),
+            priority: 0x4000,
+            affinity: 0,
+        }])
+        .unwrap();
+        fs::write(temp.path(), &legacy).unwrap();
+        let mut book = RuleBook::load(&temp.path()).unwrap();
+        assert!(book.apply_new(std::slice::from_ref(&old_row)).is_empty());
+        assert_eq!(priority(&old_row), old_priority);
+        assert_eq!(fs::read(temp.path()).unwrap(), legacy);
+        let future = ControlledChild::new();
+        let future_row = future.row();
+        assert!(book.apply_new(std::slice::from_ref(&future_row)).is_empty());
+        assert_eq!(priority(&future_row), 0x4000);
+    }
+
+    #[test]
+    fn failed_save_keeps_activation_rule_and_application_state_unchanged() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let temp = Temporary::new();
+        let mut book = RuleBook::load(&temp.path()).unwrap();
+        let executable = std::env::current_exe()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        book.upsert(ProcessRule {
+            executable: executable.clone(),
+            priority: 0x4000,
+            affinity: 0,
+        })
+        .unwrap();
+        let saved = fs::read(temp.path()).unwrap();
+        let child = ControlledChild::new();
+        let row = child.row();
+        // Deny delete-sharing on this fixture file so its atomic replacement fails.
+        let _locked = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(temp.path())
+            .unwrap();
+        assert!(
+            book.upsert(ProcessRule {
+                executable: executable.clone(),
+                priority: 0x40,
+                affinity: 0
+            })
+            .is_err()
+        );
+        assert_eq!(book.rules()[0].priority, 0x4000);
+        assert!(book.apply_new(std::slice::from_ref(&row)).is_empty());
+        assert_eq!(
+            priority(&row),
+            0x4000,
+            "failed edit advanced the activation cutoff"
+        );
+        set_scheduling(row.pid, row.times.unwrap().created, 0x20, 0).unwrap();
+        assert!(book.remove(&executable).is_err());
+        assert!(book.apply_new(std::slice::from_ref(&row)).is_empty());
+        assert_eq!(
+            priority(&row),
+            0x20,
+            "failed save reset successful-application bookkeeping"
+        );
+        assert_eq!(fs::read(temp.path()).unwrap(), saved);
     }
 }

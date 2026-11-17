@@ -39,6 +39,8 @@ const TABLE: usize = 107;
 const TABS: usize = 108;
 const STALE_AFTER: Duration = Duration::from_secs(10);
 const NIN_KEYSELECT_NOTIFICATION: u32 = NIN_SELECT | NINF_KEY;
+// Win32 integer resources are low-word IDs, not aligned/dereferenceable pointers.
+const APP_ICON_RESOURCE: *const u16 = ptr::without_provenance::<u16>(1);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Key {
@@ -183,6 +185,17 @@ fn scroll_target(previous_top: usize, anchor_index: Option<usize>, row_count: us
     anchor_index
         .unwrap_or(previous_top)
         .min(row_count.saturating_sub(1))
+}
+
+fn detail_view_demand(is_visible: bool, is_iconic: bool) -> bool {
+    is_visible && !is_iconic
+}
+
+unsafe fn update_visibility(hwnd: HWND, shared: &Shared) -> bool {
+    // SAFETY: caller owns the live window on this UI thread; both queries take opaque handles.
+    let demand = unsafe { detail_view_demand(IsWindowVisible(hwnd) != 0, IsIconic(hwnd) != 0) };
+    shared.visible.store(demand, Ordering::Release);
+    demand
 }
 
 impl Ui {
@@ -885,7 +898,7 @@ impl Ui {
                     &self.shared.current_settings(),
                 );
             }
-            if IsWindowVisible(self.hwnd) != 0 {
+            if update_visibility(self.hwnd, &self.shared) {
                 if force
                     || match self.tab {
                         0 => processes_changed,
@@ -1197,7 +1210,6 @@ unsafe fn show(ui: &mut Ui) -> Effect {
             },
         );
         SetForegroundWindow(ui.hwnd);
-        ui.shared.visible.store(true, Ordering::Release);
         ui.refresh(true)
     }
 }
@@ -1218,6 +1230,11 @@ unsafe extern "system" fn procedure(
         if message == WM_SAMPLE_UPDATED {
             state.shared.notifier.acknowledge();
         }
+        if matches!(message, WM_SIZE | WM_SHOWWINDOW) {
+            // Demand must be reconciled even when a synchronous resize/show
+            // notification re-enters while Ui is already mutably borrowed.
+            update_visibility(hwnd, &state.shared);
+        }
         // Synchronous common-control notifications and modal loops may re-enter us.
         // Never create an aliased &mut Ui; nested layout notifications can be ignored.
         let Ok(mut ui) = state.ui.try_borrow_mut() else {
@@ -1234,7 +1251,11 @@ unsafe extern "system" fn procedure(
             WM_SHOW_EXISTING => {
                 effect = show(&mut ui);
             }
-            WM_SIZE => ui.layout(),
+            WM_SIZE => {
+                if wparam != SIZE_MINIMIZED as usize {
+                    ui.layout();
+                }
+            }
             WM_GETMINMAXINFO => {
                 if lparam != 0 {
                     let info = &mut *(lparam as *mut MINMAXINFO);
@@ -1244,9 +1265,7 @@ unsafe extern "system" fn procedure(
                     };
                 }
             }
-            WM_SHOWWINDOW => {
-                ui.shared.visible.store(wparam != 0, Ordering::Release);
-            }
+            WM_SHOWWINDOW => {}
             WM_CLOSE => {
                 ShowWindow(hwnd, SW_HIDE);
                 ui.shared.visible.store(false, Ordering::Release);
@@ -1344,6 +1363,7 @@ unsafe extern "system" fn procedure(
             }
             WM_NCDESTROY => {
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                drop(ui);
                 return DefWindowProcW(hwnd, message, wparam, lparam);
             }
             _ if message == ui.taskbar_created => {
@@ -1352,7 +1372,12 @@ unsafe extern "system" fn procedure(
                 }
                 effect = ui.refresh(false);
             }
-            _ => return DefWindowProcW(hwnd, message, wparam, lparam),
+            _ => {
+                // Default processing can call accessibility providers and pump
+                // nested messages. Let those messages borrow the UI normally.
+                drop(ui);
+                return DefWindowProcW(hwnd, message, wparam, lparam);
+            }
         }
         let shared = Arc::clone(&ui.shared);
         drop(ui); // Modal dialogs and confirmations pump messages: release before entering them.
@@ -1373,14 +1398,24 @@ pub fn run(shared: Arc<Shared>, start_hidden: bool) -> Result<(), String> {
         }
         let instance = GetModuleHandleW(ptr::null());
         let class = wide(WINDOW_CLASS);
-        let icon = LoadImageW(
+        let mut icon = LoadImageW(
             instance,
-            ptr::dangling::<u16>(), // MAKEINTRESOURCEW(1), interpreted as a resource ID by Win32.
+            APP_ICON_RESOURCE,
             IMAGE_ICON,
             0,
             0,
             LR_DEFAULTSIZE | LR_SHARED,
         ) as HICON;
+        if icon.is_null() {
+            // Shared system icon remains valid for the registered window class.
+            icon = LoadIconW(ptr::null_mut(), IDI_APPLICATION);
+            if icon.is_null() {
+                return Err(format!(
+                    "Не удалось загрузить значок приложения: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
         let wc = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(procedure),
@@ -1440,7 +1475,6 @@ pub fn run(shared: Arc<Shared>, start_hidden: bool) -> Result<(), String> {
         );
         shared.notifier.bind(hwnd);
         shared.active_tab.store(0, Ordering::Release);
-        shared.visible.store(!start_hidden, Ordering::Release);
         if !start_hidden {
             ShowWindow(hwnd, SW_SHOW);
         }
@@ -1512,5 +1546,12 @@ mod tests {
         assert_eq!(scroll_target(42, Some(55), 800), 55);
         assert_eq!(scroll_target(42, None, 20), 19);
         assert_eq!(scroll_target(42, Some(55), 0), 0);
+    }
+    #[test]
+    fn detailed_collection_and_rebuild_demand_excludes_minimized_windows() {
+        assert!(detail_view_demand(true, false));
+        assert!(!detail_view_demand(true, true));
+        assert!(!detail_view_demand(false, false));
+        assert!(!detail_view_demand(false, true));
     }
 }

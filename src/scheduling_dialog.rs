@@ -369,9 +369,14 @@ unsafe extern "system" fn procedure(
             }
             WM_NCDESTROY => {
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                drop(state);
                 return DefWindowProcW(hwnd, message, wparam, lparam);
             }
-            _ => return DefWindowProcW(hwnd, message, wparam, lparam),
+            _ => {
+                // Native default handling may re-enter through accessibility.
+                drop(state);
+                return DefWindowProcW(hwnd, message, wparam, lparam);
+            }
         }
         0
     }
