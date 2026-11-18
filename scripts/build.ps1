@@ -2,7 +2,8 @@ param(
     [ValidateSet('Debug', 'Release')]
     [string]$Configuration = 'Release',
     [switch]$SensorsOnly,
-    [switch]$SkipFetch
+    [switch]$SkipFetch,
+    [string]$OutputDirectory
 )
 
 $ErrorActionPreference = 'Stop'
@@ -31,7 +32,13 @@ try {
     & $cargoPath @cargoArguments
     if ($LASTEXITCODE -ne 0) { throw 'Rust build failed.' }
     $targetDirectory = Join-Path $projectRoot ('target\' + $Configuration.ToLowerInvariant())
-    $distributionDirectory = Join-Path $projectRoot 'dist\AnVir-Next'
+    $distributionDirectory = if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
+        Join-Path $projectRoot 'dist\AnVir-Next'
+    } elseif ([System.IO.Path]::IsPathRooted($OutputDirectory)) {
+        [System.IO.Path]::GetFullPath($OutputDirectory)
+    } else {
+        [System.IO.Path]::GetFullPath((Join-Path $projectRoot $OutputDirectory))
+    }
     New-Item -ItemType Directory -Path $distributionDirectory -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $targetDirectory 'anvir-next.exe') -Destination (Join-Path $distributionDirectory 'AnVir-Next.exe') -Force
     $sensorDestination = Join-Path $distributionDirectory 'hardware-monitor'

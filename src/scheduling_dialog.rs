@@ -1,5 +1,5 @@
 //! Explicit per-process scheduling choices. This module never mutates a process.
-use crate::{processes::ProcessDetails, win::wide};
+use crate::{icons::ActionImages, processes::ProcessDetails, win::wide};
 use std::{
     cell::{Cell, RefCell},
     mem::size_of,
@@ -8,11 +8,16 @@ use std::{
 use windows_sys::Win32::{
     Foundation::*,
     Graphics::Gdi::*,
-    System::{LibraryLoader::GetModuleHandleW, Threading::*},
+    System::{
+        LibraryLoader::GetModuleHandleW,
+        SystemServices::{SS_ICON, SS_REALSIZECONTROL},
+        Threading::*,
+    },
     UI::{
         Controls::*,
         HiDpi::GetDpiForWindow,
         Input::KeyboardAndMouse::{EnableWindow, IsWindowEnabled, SetFocus},
+        Shell::{SIID_AUTOLIST, SIID_DELETE, SIID_INFO, SIID_SETTINGS},
         WindowsAndMessaging::*,
     },
 };
@@ -49,6 +54,7 @@ struct Dialog {
     allowed: u64,
     result: Option<Choice>,
     done: bool,
+    _images: ActionImages,
 }
 
 impl Drop for Dialog {
@@ -77,6 +83,8 @@ pub unsafe fn show(owner: HWND, details: &ProcessDetails) -> Result<Option<Choic
             cbSize: size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(procedure),
             hInstance: instance,
+            hIcon: GetClassLongPtrW(owner, GCLP_HICON) as HICON,
+            hIconSm: GetClassLongPtrW(owner, GCLP_HICONSM) as HICON,
             hCursor: LoadCursorW(ptr::null_mut(), IDC_ARROW),
             hbrBackground: (COLOR_BTNFACE + 1) as HBRUSH,
             lpszClassName: class.as_ptr(),
@@ -148,7 +156,19 @@ pub unsafe fn show(owner: HWND, details: &ProcessDetails) -> Result<Option<Choic
             SendMessageW(control, WM_SETFONT, font as usize, 0);
             control
         };
-        child("STATIC", "Приоритет процесса", 0, 0, 18, 16, 180, 23);
+        let images = ActionImages::new(dpi);
+        let priority_icon = child(
+            "STATIC",
+            "",
+            SS_ICON | SS_REALSIZECONTROL,
+            0,
+            18,
+            18,
+            16,
+            16,
+        );
+        images.apply_label(priority_icon, SIID_SETTINGS);
+        child("STATIC", "Приоритет процесса", 0, 0, 42, 16, 156, 23);
         let combo = child(
             "COMBOBOX",
             "",
@@ -166,14 +186,25 @@ pub unsafe fn show(owner: HWND, details: &ProcessDetails) -> Result<Option<Choic
             .iter()
             .position(|(priority, _)| *priority == details.priority);
         SendMessageW(combo, CB_SETCURSEL, selected.unwrap_or(usize::MAX), 0);
+        let processors_icon = child(
+            "STATIC",
+            "",
+            SS_ICON | SS_REALSIZECONTROL,
+            0,
+            18,
+            61,
+            16,
+            16,
+        );
+        images.apply_label(processors_icon, SIID_AUTOLIST);
         child(
             "STATIC",
             "Разрешённые логические процессоры",
             0,
             0,
-            18,
+            42,
             59,
-            480,
+            486,
             22,
         );
         let mut processors = Vec::new();
@@ -203,7 +234,7 @@ pub unsafe fn show(owner: HWND, details: &ProcessDetails) -> Result<Option<Choic
             );
             processors.push((index, control));
         }
-        child(
+        let select_all = child(
             "BUTTON",
             "Все",
             BS_PUSHBUTTON as u32 | WS_TABSTOP,
@@ -213,6 +244,7 @@ pub unsafe fn show(owner: HWND, details: &ProcessDetails) -> Result<Option<Choic
             105,
             28,
         );
+        images.apply_button(select_all, SIID_AUTOLIST);
         let remember = child(
             "BUTTON",
             "Запомнить для будущих запусков этого .exe",
@@ -223,17 +255,28 @@ pub unsafe fn show(owner: HWND, details: &ProcessDetails) -> Result<Option<Choic
             510,
             25,
         );
+        let warning_icon = child(
+            "STATIC",
+            "",
+            SS_ICON | SS_REALSIZECONTROL,
+            0,
+            18,
+            385,
+            16,
+            16,
+        );
+        images.apply_label(warning_icon, SIID_INFO);
         child(
             "STATIC",
             "Высокий приоритет может ухудшить отзывчивость Windows.",
             0,
             0,
-            18,
+            42,
             382,
-            510,
+            486,
             22,
         );
-        child(
+        let apply = child(
             "BUTTON",
             "Применить",
             BS_DEFPUSHBUTTON as u32 | WS_TABSTOP,
@@ -243,7 +286,8 @@ pub unsafe fn show(owner: HWND, details: &ProcessDetails) -> Result<Option<Choic
             108,
             30,
         );
-        child(
+        images.apply_button(apply, SIID_SETTINGS);
+        let cancel = child(
             "BUTTON",
             "Отмена",
             BS_PUSHBUTTON as u32 | WS_TABSTOP,
@@ -253,6 +297,7 @@ pub unsafe fn show(owner: HWND, details: &ProcessDetails) -> Result<Option<Choic
             105,
             30,
         );
+        images.apply_button(cancel, SIID_DELETE);
         if control_failed.get() {
             DestroyWindow(hwnd);
             DeleteObject(font);
@@ -267,12 +312,14 @@ pub unsafe fn show(owner: HWND, details: &ProcessDetails) -> Result<Option<Choic
             allowed: details.available_affinity,
             result: None,
             done: false,
+            _images: images,
         }));
         SetWindowLongPtrW(
             hwnd,
             GWLP_USERDATA,
             (&mut *state as *mut RefCell<Dialog>) as isize,
         );
+        crate::theme::apply_window(hwnd);
         let was_enabled = IsWindowEnabled(owner) != 0;
         EnableWindow(owner, 0);
         ShowWindow(hwnd, SW_SHOW);
@@ -314,6 +361,9 @@ unsafe extern "system" fn procedure(
 ) -> LRESULT {
     // SAFETY: userdata points to the Box retained by show; Windows supplies HWND/message parameters.
     unsafe {
+        if let Some(result) = crate::theme::handle_message(hwnd, message, wparam, lparam) {
+            return result;
+        }
         let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<Dialog>;
         if pointer.is_null() {
             return DefWindowProcW(hwnd, message, wparam, lparam);

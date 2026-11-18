@@ -441,7 +441,7 @@ mod tests {
         let temp = Temporary::new();
         let mut book = RuleBook::load(&temp.path()).unwrap();
         let mut row = crate::processes::ProcessSampler::default()
-            .sample(1)
+            .sample(1, false)
             .into_iter()
             .find(|row| row.pid == std::process::id())
             .unwrap();
@@ -510,7 +510,7 @@ mod tests {
         }
         fn row(&self) -> ProcessRow {
             crate::processes::ProcessSampler::default()
-                .sample(1)
+                .sample(1, false)
                 .into_iter()
                 .find(|row| row.pid == self.0.id())
                 .unwrap()

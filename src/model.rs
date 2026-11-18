@@ -83,6 +83,13 @@ impl<const N: usize> History<N> {
             .map(|offset| self.values[(start + offset) % N])
             .collect()
     }
+
+    pub fn peak(&self) -> f64 {
+        self.values[..self.length]
+            .iter()
+            .copied()
+            .fold(0.0, f64::max)
+    }
 }
 
 pub fn format_bytes(bytes: f64) -> String {

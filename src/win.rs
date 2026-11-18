@@ -57,6 +57,54 @@ pub fn filetime(time: FILETIME) -> u64 {
     (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
 }
 
+/// Relaunch this executable through the normal Windows consent dialog. Only
+/// pass arguments validated by the caller; `false` means consent was cancelled.
+pub fn launch_elevated(parameters: &str) -> Result<bool, String> {
+    use windows_sys::Win32::{
+        Foundation::ERROR_CANCELLED,
+        System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize},
+        UI::{
+            Shell::{SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, ShellExecuteExW},
+            WindowsAndMessaging::SW_SHOWNORMAL,
+        },
+    };
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let directory = executable
+        .parent()
+        .ok_or("Не удалось найти папку AnVir Next")?;
+    let directory = os_wide(directory.as_os_str());
+    let path = os_wide(executable.as_os_str());
+    let verb = wide("runas");
+    let parameters = wide(parameters);
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC,
+        lpVerb: verb.as_ptr(),
+        lpFile: path.as_ptr(),
+        lpParameters: parameters.as_ptr(),
+        lpDirectory: directory.as_ptr(),
+        nShow: SW_SHOWNORMAL,
+        ..Default::default()
+    };
+    // SAFETY: COM is initialized on this thread and balanced on success.
+    // The strings and writable execution record stay valid throughout the call.
+    unsafe {
+        let initialized = CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) >= 0;
+        let launched = ShellExecuteExW(&mut info) != 0;
+        let error = (!launched).then(io::Error::last_os_error);
+        if initialized {
+            CoUninitialize();
+        }
+        match error {
+            None => Ok(true),
+            Some(error) if error.raw_os_error() == Some(ERROR_CANCELLED as i32) => Ok(false),
+            Some(error) => Err(format!(
+                "Не удалось запустить AnVir Next от имени администратора: {error}"
+            )),
+        }
+    }
+}
+
 pub struct Handle(HANDLE);
 
 impl Handle {

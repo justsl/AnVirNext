@@ -8,6 +8,7 @@ use std::{
     io,
     mem::size_of,
     ptr,
+    sync::Arc,
     time::{Duration, Instant},
 };
 use windows_sys::{
@@ -33,8 +34,14 @@ const MAX_SNAPSHOT: usize = 32 * 1024 * 1024;
 const MAX_IDENTITIES: usize = 8192;
 const MAX_METADATA: usize = 1024;
 const MAX_QUERY: usize = 128 * 1024;
+const MAX_ARGUMENT_BYTES: usize = 16 * 1024 * 1024;
 const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xc0000004u32 as i32;
 const STATUS_BUFFER_TOO_SMALL: i32 = 0xc0000023u32 as i32;
+
+#[path = "startup_program.rs"]
+mod startup_program;
+pub use startup_program::{StartupRuntimeOutcome, start_startup_program, stop_startup_program};
+pub type ProcessName = ((u32, u64), String);
 
 #[derive(Clone, Debug)]
 pub struct ProcessRow {
@@ -50,6 +57,14 @@ pub struct ProcessRow {
     pub product: String,
     pub company: String,
     pub is_64_bit: Option<bool>,
+    pub icon_index: Option<i32>,
+    /// Original tail after CRT argv[0]; None means unavailable/not requested,
+    /// while Some("") means the command line was read and has no arguments.
+    pub arguments: Option<Arc<str>>,
+    pub network_receive: Option<f64>,
+    pub network_send: Option<f64>,
+    pub disk_read: Option<f64>,
+    pub disk_write: Option<f64>,
 }
 
 // Native SystemProcessInformation ABI for Windows 11. Explicit time/I/O
@@ -97,6 +112,7 @@ struct NativeProcess {
 struct IdentityMetadata {
     path: String,
     is_64_bit: Option<bool>,
+    icon_index: Option<i32>,
     retry_at: Instant,
 }
 struct VersionMetadata {
@@ -110,17 +126,108 @@ struct Previous {
 }
 
 #[derive(Default)]
+struct ArgumentsCache {
+    entries: HashMap<(u32, u64), CachedArguments>,
+    bytes: usize,
+}
+enum CachedArguments {
+    Ready(Option<Arc<str>>),
+    Deferred(usize),
+}
+impl ArgumentsCache {
+    fn resolve(
+        &mut self,
+        identity: (u32, u64),
+        include: bool,
+        query: impl FnOnce() -> Result<String, String>,
+    ) -> Option<Arc<str>> {
+        if !include || identity.1 == 0 {
+            return None;
+        }
+        let available = MAX_ARGUMENT_BYTES - self.bytes;
+        match self.entries.get(&identity) {
+            Some(CachedArguments::Ready(value)) => return value.clone(),
+            Some(CachedArguments::Deferred(required)) if *required > available => return None,
+            None if self.entries.len() >= MAX_IDENTITIES => return None,
+            _ => {}
+        }
+        if available == 0 {
+            self.entries.insert(identity, CachedArguments::Deferred(1));
+            return None;
+        }
+        let value = match query() {
+            Ok(command) => {
+                let tail = arguments_tail(&command);
+                if tail.len() > available {
+                    self.entries
+                        .insert(identity, CachedArguments::Deferred(tail.len()));
+                    return None;
+                }
+                Some(Arc::<str>::from(tail))
+            }
+            Err(_) => None,
+        };
+        self.bytes += value.as_deref().map_or(0, str::len);
+        self.entries
+            .insert(identity, CachedArguments::Ready(value.clone()));
+        value
+    }
+    fn retain_live(&mut self, mut is_live: impl FnMut(&(u32, u64)) -> bool) {
+        self.entries.retain(|identity, state| {
+            if is_live(identity) {
+                return true;
+            }
+            if let CachedArguments::Ready(Some(value)) = state {
+                self.bytes -= value.len();
+            }
+            false
+        });
+    }
+}
+fn arguments_tail(command: &str) -> &str {
+    // CRT treats argv[0] specially: quotes toggle anywhere in its path;
+    // backslashes are literal. Only a space/tab outside quotes ends argv[0].
+    // Slice the original tail instead of reserializing the remaining arguments.
+    let command = command.split('\0').next().unwrap_or_default();
+    let mut quoted = false;
+    for (offset, byte) in command.bytes().enumerate() {
+        match byte {
+            b'"' => quoted = !quoted,
+            b' ' | b'\t' if !quoted => return command[offset..].trim_start_matches([' ', '\t']),
+            _ => {}
+        }
+    }
+    ""
+}
+
+#[derive(Default)]
 pub struct ProcessSampler {
     buffer: Vec<usize>,
     previous: HashMap<u32, Previous>,
     identities: HashMap<(u32, u64), IdentityMetadata>,
+    arguments: ArgumentsCache,
     versions: HashMap<String, VersionMetadata>,
     sampled_at: Option<Instant>,
     pub last_error: Option<String>,
 }
 
 impl ProcessSampler {
-    pub fn sample(&mut self, logical: usize) -> Vec<ProcessRow> {
+    /// One native snapshot; no per-process handles, metadata, icons or arguments.
+    pub fn sample_names(&mut self) -> Result<Vec<ProcessName>, String> {
+        let length = system_snapshot(&mut self.buffer)?;
+        let mut names = Vec::new();
+        let mut offset = 0;
+        while let Some(info) = next_process(&self.buffer, length, &mut offset)? {
+            let Ok(pid) = u32::try_from(info.pid as usize) else {
+                continue;
+            };
+            let name = snapshot_name(pid, info.image, self.buffer.as_ptr().cast(), length)?;
+            names.push(((pid, info.created.max(0) as u64), name));
+        }
+        Ok(names)
+    }
+    /// Command-line access is opt-in; hidden rule-only sampling must pass false.
+    pub fn sample(&mut self, logical: u32, include_arguments: bool) -> Vec<ProcessRow> {
         let length = match system_snapshot(&mut self.buffer) {
             Ok(length) => length,
             Err(error) => {
@@ -135,19 +242,14 @@ impl ProcessSampler {
         let mut previous = HashMap::new();
         let mut live = HashMap::new();
         let mut offset = 0usize;
-        while offset
-            .checked_add(size_of::<NativeProcess>())
-            .is_some_and(|end| end <= length)
-        {
-            // SAFETY: the complete fixed header lies within the returned buffer.
-            let info = unsafe {
-                ptr::read_unaligned(
-                    self.buffer
-                        .as_ptr()
-                        .cast::<u8>()
-                        .add(offset)
-                        .cast::<NativeProcess>(),
-                )
+        loop {
+            let info = match next_process(&self.buffer, length, &mut offset) {
+                Ok(Some(info)) => info,
+                Ok(None) => break,
+                Err(error) => {
+                    self.last_error = Some(error);
+                    break;
+                }
             };
             let pid = info.pid as usize;
             if pid <= u32::MAX as usize {
@@ -162,9 +264,9 @@ impl ProcessSampler {
                     .previous
                     .get(&pid)
                     .filter(|old| old.times.created == times.created);
-                let cpu = old
-                    .zip(elapsed)
-                    .and_then(|(old, elapsed)| process_cpu(old.times, times, elapsed, logical));
+                let cpu = old.zip(elapsed).and_then(|(old, elapsed)| {
+                    process_cpu(old.times, times, elapsed, logical as usize)
+                });
                 let io_rate = old
                     .zip(elapsed)
                     .and_then(|(old, elapsed)| counter_rate(old.io, io, elapsed));
@@ -179,17 +281,11 @@ impl ProcessSampler {
                     live.insert(key, metadata.clone());
                 }
                 let (product, company) = self.version_metadata(&metadata.path, now);
-                let name = unicode_from_buffer(info.image, self.buffer.as_ptr().cast(), length)
-                    .unwrap_or_default();
+                let name = snapshot_name(pid, info.image, self.buffer.as_ptr().cast(), length)
+                    .unwrap_or_else(|_| format!("PID {pid}"));
                 rows.push(ProcessRow {
                     pid,
-                    name: if pid == 0 {
-                        "System Idle Process".into()
-                    } else if name.is_empty() {
-                        format!("PID {pid}")
-                    } else {
-                        name
-                    },
+                    name,
                     times: Some(times),
                     cpu,
                     memory: Some(info.working_set as u64),
@@ -198,25 +294,36 @@ impl ProcessSampler {
                     product,
                     company,
                     is_64_bit: metadata.is_64_bit,
+                    icon_index: metadata.icon_index,
+                    arguments: None,
+                    network_receive: None,
+                    network_send: None,
+                    disk_read: None,
+                    disk_write: None,
                 });
                 if previous.len() < MAX_IDENTITIES {
                     previous.insert(pid, Previous { times, io });
                 }
             }
-            if info.next == 0 {
-                break;
-            }
-            let next = offset.checked_add(info.next as usize);
-            if info.next < size_of::<NativeProcess>() as u32
-                || next.is_none_or(|next| next >= length)
-            {
-                self.last_error = Some("Invalid native process snapshot entry".into());
-                break;
-            }
-            offset = next.unwrap();
         }
         self.previous = previous;
         self.identities = live;
+        self.arguments
+            .retain_live(|identity| self.identities.contains_key(identity));
+        if include_arguments {
+            for row in &mut rows {
+                let Some(times) = row.times.filter(|times| times.created != 0) else {
+                    continue;
+                };
+                let identity = (row.pid, times.created);
+                if !self.identities.contains_key(&identity) {
+                    continue;
+                }
+                row.arguments = self.arguments.resolve(identity, include_arguments, || {
+                    query_process_command_line(row.pid, times.created)
+                });
+            }
+        }
         self.sampled_at = Some(now);
         rows
     }
@@ -252,6 +359,64 @@ impl ProcessSampler {
         );
         (product, company)
     }
+}
+
+fn next_process(
+    buffer: &[usize],
+    length: usize,
+    offset: &mut usize,
+) -> Result<Option<NativeProcess>, String> {
+    if *offset == usize::MAX {
+        return Ok(None);
+    }
+    if length > std::mem::size_of_val(buffer)
+        || offset
+            .checked_add(size_of::<NativeProcess>())
+            .is_none_or(|end| end > length)
+    {
+        return Err("Truncated native process snapshot entry".into());
+    }
+    // SAFETY: the complete fixed header lies inside the validated live allocation.
+    let info = unsafe {
+        ptr::read_unaligned(
+            buffer
+                .as_ptr()
+                .cast::<u8>()
+                .add(*offset)
+                .cast::<NativeProcess>(),
+        )
+    };
+    if info.next == 0 {
+        *offset = usize::MAX;
+    } else {
+        let next = offset.checked_add(info.next as usize);
+        if info.next < size_of::<NativeProcess>() as u32
+            || next
+                .and_then(|next| next.checked_add(size_of::<NativeProcess>()))
+                .is_none_or(|end| end > length)
+        {
+            return Err("Invalid native process snapshot offset".into());
+        }
+        *offset = next.unwrap();
+    }
+    Ok(Some(info))
+}
+
+fn snapshot_name(
+    pid: u32,
+    image: UNICODE_STRING,
+    base: *const u8,
+    length: usize,
+) -> Result<String, String> {
+    if pid == 0 {
+        return Ok("System Idle Process".into());
+    }
+    let name = unicode_from_buffer(image, base, length)?;
+    Ok(if name.is_empty() {
+        format!("PID {pid}")
+    } else {
+        name
+    })
 }
 
 fn system_snapshot(buffer: &mut Vec<usize>) -> Result<usize, String> {
@@ -321,6 +486,7 @@ fn process_metadata(pid: u32, created: u64, now: Instant) -> IdentityMetadata {
     let mut result = IdentityMetadata {
         path: String::new(),
         is_64_bit: None,
+        icon_index: None,
         retry_at: now + Duration::from_secs(30),
     };
     let Ok(handle) = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION) else {
@@ -330,6 +496,7 @@ fn process_metadata(pid: u32, created: u64, now: Instant) -> IdentityMetadata {
         return result;
     }
     result.path = executable_path(handle.raw()).unwrap_or_default();
+    result.icon_index = crate::icons::for_file(&result.path);
     let (mut process_machine, mut native_machine) = (0, 0);
     // SAFETY: valid query handle and writable machine-code outputs.
     if unsafe { IsWow64Process2(handle.raw(), &mut process_machine, &mut native_machine) } != 0 {
@@ -504,6 +671,15 @@ fn command_line(handle: HANDLE) -> Result<String, String> {
     Err("Command line changed too quickly; select process again".into())
 }
 
+fn query_process_command_line(pid: u32, created: u64) -> Result<String, String> {
+    if pid <= 4 || created == 0 {
+        return Err("Process command line unavailable".into());
+    }
+    let handle = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+    verify_identity(handle.raw(), pid, created)?;
+    command_line(handle.raw())
+}
+
 #[derive(Clone, Debug)]
 pub struct ProcessDetails {
     pub command_line: String,
@@ -588,14 +764,19 @@ fn mutation_handle(pid: u32, created: u64, access: u32) -> Result<Handle, String
         return Err("Changing system or own process is prohibited".into());
     }
     let handle = open_process(pid, access | PROCESS_QUERY_LIMITED_INFORMATION)?;
-    let times = verify_identity(handle.raw(), pid, created)?;
+    validate_held_action(handle.raw(), pid, created)?;
+    Ok(handle)
+}
+
+fn validate_held_action(handle: HANDLE, pid: u32, created: u64) -> Result<(), String> {
+    let times = verify_identity(handle, pid, created)?;
     let mut critical = 0;
     // SAFETY: valid query handle and writable BOOL; failures deliberately fail closed.
-    if unsafe { IsProcessCritical(handle.raw(), &mut critical) } == 0 {
+    if unsafe { IsProcessCritical(handle, &mut critical) } == 0 {
         return Err(last_error("Verify process critical status"));
     }
     // SAFETY: valid process handle.
-    let actual_pid = unsafe { GetProcessId(handle.raw()) };
+    let actual_pid = unsafe { GetProcessId(handle) };
     validate_action(
         pid,
         created,
@@ -603,14 +784,26 @@ fn mutation_handle(pid: u32, created: u64, access: u32) -> Result<Handle, String
         times.created,
         critical != 0,
         std::process::id(),
-    )?;
-    Ok(handle)
+    )
+}
+
+pub(crate) fn validate_process_stop(pid: u32) -> Result<(), String> {
+    if pid <= 4 || pid == std::process::id() {
+        return Err("Changing system or own process is prohibited".into());
+    }
+    let handle = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+    let created = process_times(handle.raw())?.created;
+    validate_held_action(handle.raw(), pid, created)
 }
 
 pub fn terminate(pid: u32, expected_created: u64) -> Result<(), String> {
     let handle = mutation_handle(pid, expected_created, PROCESS_TERMINATE)?;
+    terminate_handle(handle.raw())
+}
+
+fn terminate_handle(handle: HANDLE) -> Result<(), String> {
     // SAFETY: identity/critical/self validation applies to this same held process handle.
-    if unsafe { TerminateProcess(handle.raw(), 1) } == 0 {
+    if unsafe { TerminateProcess(handle, 1) } == 0 {
         return Err(last_error("Terminate process"));
     }
     Ok(())
@@ -691,10 +884,289 @@ mod tests {
     use super::*;
 
     #[test]
+    fn name_snapshot_has_native_identity_and_keeps_metadata_caches_untouched() {
+        let mut sampler = ProcessSampler::default();
+        let names = sampler.sample_names().unwrap();
+        let ((pid, created), name) = names
+            .iter()
+            .find(|((pid, _), _)| *pid == std::process::id())
+            .unwrap();
+        assert_eq!(*pid, std::process::id());
+        assert!(*created > 0);
+        assert!(!name.is_empty());
+        assert!(sampler.identities.is_empty());
+        assert!(sampler.arguments.entries.is_empty());
+        assert!(sampler.versions.is_empty());
+        assert!(sampler.previous.is_empty());
+        assert!(sampler.sampled_at.is_none());
+    }
+
+    #[test]
+    fn shared_native_cursor_rejects_truncated_backward_and_out_of_range_offsets() {
+        let size = size_of::<NativeProcess>();
+        let mut buffer = vec![0usize; 2 * size / size_of::<usize>()];
+        // SAFETY: NativeProcess consists entirely of integers and raw pointers;
+        // all-zero bits are valid, and the fixture never dereferences its fields.
+        let mut first: NativeProcess = unsafe { std::mem::zeroed() };
+        first.next = size as u32;
+        first.pid = 7usize as HANDLE;
+        let mut second = first;
+        second.next = 0;
+        second.pid = 8usize as HANDLE;
+        // SAFETY: both complete headers fit in the aligned fixture allocation.
+        unsafe {
+            ptr::write(buffer.as_mut_ptr().cast::<NativeProcess>(), first);
+            ptr::write(
+                buffer
+                    .as_mut_ptr()
+                    .cast::<u8>()
+                    .add(size)
+                    .cast::<NativeProcess>(),
+                second,
+            );
+        }
+        let mut offset = 0;
+        assert_eq!(
+            next_process(&buffer, 2 * size, &mut offset)
+                .unwrap()
+                .unwrap()
+                .pid as usize,
+            7
+        );
+        assert_eq!(
+            next_process(&buffer, 2 * size, &mut offset)
+                .unwrap()
+                .unwrap()
+                .pid as usize,
+            8
+        );
+        assert!(
+            next_process(&buffer, 2 * size, &mut offset)
+                .unwrap()
+                .is_none()
+        );
+        assert!(next_process(&buffer, size - 1, &mut 0).is_err());
+        assert!(next_process(&buffer, 2 * size + 1, &mut 0).is_err());
+        for next in [1, (size - 1) as u32, (2 * size) as u32, u32::MAX] {
+            first.next = next;
+            // SAFETY: rewrites one complete validated fixture header.
+            unsafe {
+                ptr::write(buffer.as_mut_ptr().cast::<NativeProcess>(), first);
+            }
+            assert!(next_process(&buffer, 2 * size, &mut 0).is_err());
+        }
+    }
+
+    #[test]
+    fn strips_only_crt_argv0_and_delimiters_preserving_the_original_tail() {
+        for (command, expected) in [
+            (
+                r#""C:\Program Files\app.exe"  --flag "two  spaces"  "" "#,
+                r#"--flag "two  spaces"  "" "#,
+            ),
+            (
+                "app.exe\t\t--name=ёжик\t\"日本 語\"  ",
+                "--name=ёжик\t\"日本 語\"  ",
+            ),
+            (
+                r#"C:\"space dir"\app.exe --path="x\\y\"z""#,
+                r#"--path="x\\y\"z""#,
+            ),
+            ("app.exe", ""),
+            ("\"app.exe\" \t", ""),
+            ("", ""),
+            (r#""" --empty-argv0"#, "--empty-argv0"),
+            (r#""unterminated argv0 --not-an-argument"#, ""),
+            (
+                "  app.exe --leading-empty-argv0",
+                "app.exe --leading-empty-argv0",
+            ),
+            ("app.exe --flag\0ignored", "--flag"),
+        ] {
+            assert_eq!(arguments_tail(command), expected, "{command:?}");
+        }
+    }
+
+    #[test]
+    fn argument_cache_is_lazy_shares_payload_and_keeps_failures_separate_from_empty_args() {
+        let mut cache = ArgumentsCache::default();
+        assert!(
+            cache
+                .resolve((10, 100), false, || panic!(
+                    "hidden collection queried arguments"
+                ))
+                .is_none()
+        );
+        let value = cache
+            .resolve((10, 100), true, || Ok("app.exe --quoted=\"x  y\"".into()))
+            .unwrap();
+        assert_eq!(&*value, "--quoted=\"x  y\"");
+        let reused = cache
+            .resolve((10, 100), true, || {
+                panic!("same identity was queried twice")
+            })
+            .unwrap();
+        assert!(Arc::ptr_eq(&value, &reused));
+        assert!(
+            cache
+                .resolve((11, 100), true, || Err("access denied".into()))
+                .is_none()
+        );
+        assert!(
+            cache
+                .resolve((11, 100), true, || panic!("protected identity was retried"))
+                .is_none()
+        );
+        assert_eq!(
+            cache
+                .resolve((12, 100), true, || Ok("app.exe".into()))
+                .as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            cache
+                .resolve((10, 101), true, || Ok("new.exe --new-identity".into()))
+                .as_deref(),
+            Some("--new-identity")
+        );
+    }
+
+    #[test]
+    fn argument_cache_releases_payload_on_exit_and_defers_queries_when_budget_is_full() {
+        let mut cache = ArgumentsCache::default();
+        let payload = "x".repeat(MAX_ARGUMENT_BYTES);
+        let value = cache
+            .resolve((1, 1), true, || Ok(format!("app.exe {payload}")))
+            .unwrap();
+        assert_eq!(cache.bytes, MAX_ARGUMENT_BYTES);
+        assert!(
+            cache
+                .resolve((2, 2), true, || panic!(
+                    "full cache queried another command line"
+                ))
+                .is_none()
+        );
+        assert!(
+            cache
+                .resolve((2, 2), true, || panic!(
+                    "deferred identity retried without room"
+                ))
+                .is_none()
+        );
+        cache.retain_live(|identity| *identity == (2, 2));
+        assert_eq!(cache.bytes, 0);
+        assert_eq!(&*value, payload);
+        assert_eq!(
+            cache
+                .resolve((2, 2), true, || Ok("next.exe --fits".into()))
+                .as_deref(),
+            Some("--fits")
+        );
+        cache.retain_live(|_| false);
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.bytes, 0);
+    }
+
+    #[test]
+    fn argument_cache_bounds_identity_bookkeeping_and_waits_for_enough_payload_room() {
+        let mut cache = ArgumentsCache::default();
+        for pid in 0..MAX_IDENTITIES as u32 {
+            assert!(
+                cache
+                    .resolve((pid, 1), true, || Err("unavailable".into()))
+                    .is_none()
+            );
+        }
+        assert!(
+            cache
+                .resolve((99999, 1), true, || panic!("identity bound was ignored"))
+                .is_none()
+        );
+        assert_eq!(cache.entries.len(), MAX_IDENTITIES);
+        cache.retain_live(|_| false);
+        let large = "x".repeat(MAX_ARGUMENT_BYTES - 4);
+        assert!(
+            cache
+                .resolve((1, 1), true, || Ok(format!("app.exe {large}")))
+                .is_some()
+        );
+        assert!(
+            cache
+                .resolve((2, 2), true, || Ok("app.exe abcdefgh".into()))
+                .is_none()
+        );
+        assert!(cache.bytes <= MAX_ARGUMENT_BYTES);
+        assert!(
+            cache
+                .resolve((2, 2), true, || panic!(
+                    "deferred command retried without enough space"
+                ))
+                .is_none()
+        );
+        cache.retain_live(|identity| *identity == (2, 2));
+        assert_eq!(
+            cache
+                .resolve((2, 2), true, || Ok("app.exe abcdefgh".into()))
+                .as_deref(),
+            Some("abcdefgh")
+        );
+    }
+
+    #[test]
+    fn visible_sampling_reads_and_shares_native_long_child_arguments_lazily() {
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let marker = format!("native-arguments-{}", "x".repeat(4096));
+        let child = Child(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "processes::tests::controlled_child",
+                    &marker,
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let mut sampler = ProcessSampler::default();
+        let hidden = sampler.sample(1, false);
+        assert!(
+            hidden
+                .iter()
+                .find(|row| row.pid == child.0.id())
+                .unwrap()
+                .arguments
+                .is_none()
+        );
+        assert!(sampler.arguments.entries.is_empty());
+        let visible = sampler.sample(1, true);
+        let row = visible.iter().find(|row| row.pid == child.0.id()).unwrap();
+        let arguments = row.arguments.as_ref().unwrap();
+        assert_eq!(
+            &**arguments,
+            format!("--ignored --exact processes::tests::controlled_child {marker}")
+        );
+        let next = sampler.sample(1, true);
+        let same = next.iter().find(|row| row.pid == child.0.id()).unwrap();
+        assert!(Arc::ptr_eq(arguments, same.arguments.as_ref().unwrap()));
+        assert!(sampler.arguments.bytes <= MAX_ARGUMENT_BYTES);
+        assert!(query_process_command_line(child.0.id(), row.times.unwrap().created + 1).is_err());
+        let hidden_again = sampler.sample(1, false);
+        assert!(hidden_again.iter().all(|row| row.arguments.is_none()));
+    }
+
+    #[test]
     fn lists_this_process_with_a_nonzero_creation_time_and_memory() {
         assert_eq!(size_of::<NativeProcess>(), 256);
         let mut sampler = ProcessSampler::default();
-        let rows = sampler.sample(1);
+        let rows = sampler.sample(1, false);
         let this = rows
             .iter()
             .find(|row| row.pid == std::process::id())
@@ -703,6 +1175,7 @@ mod tests {
         assert!(this.memory.is_some_and(|memory| memory > 0));
         assert!(this.path.ends_with(".exe"));
         assert_eq!(this.is_64_bit, Some(true));
+        assert!(this.icon_index.is_some_and(|index| index >= 0));
         assert!(sampler.last_error.is_none(), "{:?}", sampler.last_error);
     }
 
@@ -719,7 +1192,7 @@ mod tests {
 
     #[test]
     fn full_command_line_and_details_are_read_without_peb_access() {
-        let rows = ProcessSampler::default().sample(1);
+        let rows = ProcessSampler::default().sample(1, false);
         let own = rows
             .iter()
             .find(|row| row.pid == std::process::id())

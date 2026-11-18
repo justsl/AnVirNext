@@ -34,9 +34,11 @@ fn run() -> Result<(), String> {
     use windows_sys::Win32::{
         Foundation::{ERROR_ALREADY_EXISTS, GetLastError},
         System::Threading::{CreateMutexW, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
-        UI::WindowsAndMessaging::*,
+        UI::{Shell::IsUserAnAdmin, WindowsAndMessaging::*},
     };
     let arguments: Vec<_> = std::env::args().skip(1).collect();
+    let preview =
+        cfg!(debug_assertions) && arguments.iter().any(|argument| argument == "--preview");
     if arguments
         .first()
         .is_some_and(|argument| argument == "--version")
@@ -49,6 +51,13 @@ fn run() -> Result<(), String> {
         .is_some_and(|argument| argument == "--diagnose-sensors")
     {
         return diagnose_sensors();
+    }
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "--diagnose-activity")
+    {
+        println!("{}", anvir_next::activity::diagnose_activity());
+        return Ok(());
     }
     if arguments
         .first()
@@ -75,7 +84,7 @@ fn run() -> Result<(), String> {
         std::thread::sleep(std::time::Duration::from_millis(1100));
         let sample = metrics.sample();
         let mut sampler = ProcessSampler::default();
-        let rows = sampler.sample(sample.logical_processors);
+        let rows = sampler.sample(sample.logical_processors as u32, true);
         let this = rows.iter().find(|row| row.pid == std::process::id());
         let command_line_available = this.and_then(|row| row.times).is_some_and(|times| {
             anvir_next::processes::details(std::process::id(), times.created).is_ok()
@@ -87,15 +96,35 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
-    if arguments
-        .first()
-        .is_some_and(|argument| argument == "--replace")
+    let parent = if let [verb, pid] = arguments.as_slice() {
+        if verb == "--replace" {
+            Some(
+                pid.parse::<u32>()
+                    .ok()
+                    .filter(|pid| *pid != 0 && *pid != std::process::id())
+                    .ok_or("Некорректный PID предыдущей копии")?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if parent.is_none()
+        && arguments
+            .iter()
+            .any(|argument| argument != "--start-hidden" && !(preview && argument == "--preview"))
     {
-        let parent = arguments
-            .get(1)
-            .and_then(|text| text.parse::<u32>().ok())
-            .filter(|pid| *pid != std::process::id())
-            .ok_or("Некорректный PID предыдущей копии")?;
+        return Err("Неизвестный аргумент командной строки".into());
+    }
+    // SAFETY: this queries the effective group membership of the current token.
+    if !preview && unsafe { IsUserAnAdmin() } == 0 {
+        // Keep the logon entry launchable by Explorer. The application starts
+        // monitoring only in the child created after the normal Windows prompt.
+        anvir_next::win::launch_elevated(&arguments.join(" "))?;
+        return Ok(());
+    }
+    if let Some(parent) = parent {
         // SAFETY: read-only synchronization access to the explicitly supplied previous application process.
         if let Ok(handle) = Handle::new(unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, parent) }) {
             // SAFETY: the process handle remains live for a bounded wait.
@@ -103,13 +132,12 @@ fn run() -> Result<(), String> {
                 return Err("Предыдущая копия AnVir Next не завершилась".into());
             }
         }
-    } else if arguments
-        .iter()
-        .any(|argument| argument != "--start-hidden")
-    {
-        return Err("Неизвестный аргумент командной строки".into());
     }
-    let mutex_name = wide("Local\\AnVirNext.Monitor.v1");
+    let mutex_name = wide(if preview {
+        "Local\\AnVirNext.Preview.v1"
+    } else {
+        "Local\\AnVirNext.Monitor.v1"
+    });
     // SAFETY: this creates/opens an unnamed-security, non-inherited session-local singleton handle.
     let raw_mutex = unsafe { CreateMutexW(std::ptr::null(), 0, mutex_name.as_ptr()) };
     // SAFETY: capture the result status immediately after CreateMutexW.
@@ -129,14 +157,32 @@ fn run() -> Result<(), String> {
     }
     let local_data = std::env::var_os("LOCALAPPDATA")
         .ok_or("Папка локальных настроек пользователя недоступна")?;
-    let directory = std::path::PathBuf::from(local_data).join("AnVirNext");
-    let settings = Settings::load_at(&directory.join("settings.json"));
+    // Debug-only visual preview: separate configuration and no notification icons,
+    // so inspecting a new build cannot interfere with the installed running copy.
+    let directory = if preview {
+        std::env::temp_dir().join("AnVirNext-preview")
+    } else {
+        std::path::PathBuf::from(local_data).join("AnVirNext")
+    };
+    let settings = if preview {
+        Settings {
+            cpu_icon: false,
+            disk_icon: false,
+            network_icon: false,
+            memory_icon: false,
+            temperature_icon: false,
+            ..Settings::default()
+        }
+    } else {
+        Settings::load_at(&directory.join("settings.json"))
+    };
     let shared = Shared::new(directory, settings)?;
     let hidden = arguments
         .iter()
         .any(|argument| argument == "--start-hidden");
     let result = anvir_next::ui::run(std::sync::Arc::clone(&shared), hidden);
     shared.shutdown();
+    shared.wait_for_shutdown();
     result
 }
 

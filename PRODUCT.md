@@ -35,7 +35,7 @@ These are implementation choices for review, not additional user requirements: n
 
 The user supplied reference screenshots and explicitly requested a working prototype with:
 - Native x64 process enumeration and correct memory readings for 64-bit programs.
-- Columns matching the reference: process, product, CPU, disk/I/O activity, memory, company and executable path. Security Risk must not exist. Network columns in the reference are disabled; per-process network tracing is not required.
+- Columns matching the reference: process, product, CPU, disk activity, memory, company and executable path. Security Risk must not exist. Subsequent explicit scope adds separate per-process network receive/send, physical disk read/write and command-line argument columns.
 - Selected-process details prominently expose the full launch command line and arguments.
 - Priority and processor-affinity changes can be saved for future launches of the same executable.
 - Accessible Windows autostart management and change monitoring.
@@ -43,3 +43,13 @@ The user supplied reference screenshots and explicitly requested a working proto
 - Low background overhead remains a high priority.
 
 Arbitrary-window hooks, antivirus/reputation features and full driver/DLL inspection remain outside the prototype.
+
+## Desktop refinement requirements
+
+- Follow the Windows application light/dark preference automatically, including changes while running; preserve native high-contrast behavior.
+- Autostart navigation uses a source tree with registry/user/machine/Run/RunOnce views, Startup-folder scopes, Task Scheduler folders and automatic services.
+- Processes and autostart show application icons and provide row context menus using their existing guarded actions.
+- Live process refresh must preserve selection and scroll; freeze row ordering while the pointer/context menu is in the table, while continuing numeric updates.
+- Delete terminates the selected process or disables an enabled supported startup item, with confirmation; text fields retain normal Delete behavior.
+- CPU tray combines blue physical-core load bars with the overall percentage. Network tray shows separate receive/send bars and excludes VPN/virtual/tunnel interfaces from both values and tooltip.
+- Process arguments must be available directly in the table and searchable. Real per-process TCP/UDP and disk activity must not be inferred from generic device I/O.

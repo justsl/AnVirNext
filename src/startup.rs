@@ -1,6 +1,9 @@
 //! Native Windows startup inventory and explicit, reversible controls.
 
-use crate::win::{Handle, os_wide, wide};
+use crate::{
+    processes::StartupRuntimeOutcome,
+    win::{Handle, os_wide, wide},
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -32,8 +35,11 @@ use windows_sys::Win32::{
     },
 };
 
+#[path = "startup_history.rs"]
+mod history;
 #[path = "startup_tasks.rs"]
 mod tasks;
+pub use history::StartupHistory;
 
 const CURRENT_VERSION: &str = r"Software\Microsoft\Windows\CurrentVersion";
 const MAX_VALUE_BYTES: usize = 64 * 1024;
@@ -41,6 +47,22 @@ const MAX_ENTRIES: usize = 8192;
 const MAX_WARNINGS: usize = 128;
 static MUTATION_LOCK: Mutex<()> = Mutex::new(());
 static WATCHER_DEGRADED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StartupOrigin {
+    Registry {
+        machine: bool,
+        view32: bool,
+        once: bool,
+    },
+    Folder {
+        common: bool,
+    },
+    Task {
+        folder: String,
+    },
+    Service,
+}
 
 #[derive(Clone, Debug)]
 pub struct StartupEntry {
@@ -51,6 +73,12 @@ pub struct StartupEntry {
     pub command: String,
     pub enabled: bool,
     pub can_toggle: bool,
+    pub icon_index: Option<i32>,
+    pub executable: Option<String>,
+    pub origin: StartupOrigin,
+    /// First observed after this installation's baseline, in UTC Windows FILETIME ticks.
+    /// Existing baseline entries have no known addition date.
+    pub added_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -80,6 +108,32 @@ enum Identity {
     Service {
         name: String,
     },
+}
+
+impl Identity {
+    fn origin(&self) -> StartupOrigin {
+        match self {
+            Self::Run {
+                machine,
+                view32,
+                once,
+                ..
+            } => StartupOrigin::Registry {
+                machine: *machine,
+                view32: *view32,
+                once: *once,
+            },
+            Self::Folder { common, .. } => StartupOrigin::Folder { common: *common },
+            Self::Task { path, .. } => StartupOrigin::Task {
+                folder: path
+                    .rsplit_once('\\')
+                    .map(|(folder, _)| if folder.is_empty() { "\\" } else { folder })
+                    .unwrap_or("\\")
+                    .into(),
+            },
+            Self::Service { .. } => StartupOrigin::Service,
+        }
+    }
 }
 
 fn parse_id(id: &str) -> Result<Identity, String> {
@@ -154,13 +208,98 @@ fn validate_entry(expected: &StartupEntry, current: &StartupEntry) -> Result<(),
     if !expected.can_toggle || !current.can_toggle {
         return Err("This startup source is read-only".into());
     }
-    if expected.id != current.id
-        || expected.command != current.command
-        || expected.enabled != current.enabled
-    {
+    validate_current_entry(expected, current)?;
+    if expected.enabled != current.enabled {
         return Err("Startup entry changed or was replaced; refresh before changing it".into());
     }
     Ok(())
+}
+
+fn validate_current_entry(expected: &StartupEntry, current: &StartupEntry) -> Result<(), String> {
+    if expected.id != current.id || expected.command != current.command {
+        return Err(
+            "Запись автозагрузки изменилась; обновите список перед выполнением действия".into(),
+        );
+    }
+    Ok(())
+}
+
+fn service_needs_control(status: &SERVICE_STATUS_PROCESS, running: bool) -> Result<bool, String> {
+    if running {
+        return match status.dwCurrentState {
+            SERVICE_RUNNING | SERVICE_START_PENDING => Ok(false),
+            SERVICE_STOPPED => Ok(true),
+            _ => Err("Служба меняет состояние или приостановлена; повторите действие позже".into()),
+        };
+    }
+    match status.dwCurrentState {
+        SERVICE_STOPPED | SERVICE_STOP_PENDING => Ok(false),
+        SERVICE_RUNNING | SERVICE_PAUSED
+            if status.dwControlsAccepted & SERVICE_ACCEPT_STOP != 0 =>
+        {
+            Ok(true)
+        }
+        _ => Err("Служба сейчас не принимает команду остановки".into()),
+    }
+}
+
+/// Explicit runtime action; startup approval/configuration is never changed here.
+pub fn set_running(entry: &StartupEntry, running: bool) -> Result<StartupRuntimeOutcome, String> {
+    let _guard = MUTATION_LOCK
+        .lock()
+        .map_err(|_| "Не удалось заблокировать действие автозагрузки")?;
+    let current = match parse_id(&entry.id)? {
+        Identity::Run {
+            machine,
+            view32,
+            once,
+            name,
+        } => run_program_entry(
+            machine,
+            view32,
+            once,
+            &name,
+            &mut StartupSnapshot::default(),
+        )?
+        .ok_or("Запись автозагрузки больше не существует")?,
+        Identity::Folder { common, name, .. } => {
+            let _com = tasks::ComScope::new()?;
+            folder_program_entry(
+                common,
+                &tasks::startup_folder(common)?.join(name),
+                &mut StartupSnapshot::default(),
+            )?
+        }
+        Identity::Task { path, .. } => {
+            tasks::set_task_running(entry, &path, running)?;
+            return Ok(StartupRuntimeOutcome::Applied);
+        }
+        Identity::Service { name } => {
+            set_service_running(entry, &name, running)?;
+            return Ok(StartupRuntimeOutcome::Applied);
+        }
+    };
+    validate_current_entry(entry, &current.entry)?;
+    let executable = current
+        .entry
+        .executable
+        .as_deref()
+        .ok_or("Не удалось безопасно определить исполняемый файл этой записи")?;
+    if running {
+        crate::processes::start_startup_program(
+            &current.entry.command,
+            executable,
+            current.expand_environment,
+            current.working_directory.as_deref(),
+        )
+    } else {
+        crate::processes::stop_startup_program(
+            &current.entry.command,
+            executable,
+            current.expand_environment,
+        )?;
+        Ok(StartupRuntimeOutcome::Applied)
+    }
 }
 
 fn id(identity: &Identity) -> String {
@@ -360,6 +499,12 @@ fn approval_state(
     }
 }
 
+struct ProgramEntry {
+    entry: StartupEntry,
+    expand_environment: bool,
+    working_directory: Option<String>,
+}
+
 fn run_entry(
     machine: bool,
     view32: bool,
@@ -367,6 +512,17 @@ fn run_entry(
     name: &str,
     snapshot: &mut StartupSnapshot,
 ) -> Result<Option<StartupEntry>, String> {
+    run_program_entry(machine, view32, once, name, snapshot)
+        .map(|entry| entry.map(|entry| entry.entry))
+}
+
+fn run_program_entry(
+    machine: bool,
+    view32: bool,
+    once: bool,
+    name: &str,
+    snapshot: &mut StartupSnapshot,
+) -> Result<Option<ProgramEntry>, String> {
     let path = run_path(once);
     let Some(key) = open_key(machine, &path, view32, KEY_QUERY_VALUE)? else {
         return Ok(None);
@@ -380,32 +536,43 @@ fn run_entry(
     } else {
         approval_state(snapshot, machine, approval_group(view32), name)
     };
-    Ok(Some(StartupEntry {
-        id: id(&Identity::Run {
-            machine,
-            view32,
-            once,
-            name: name.into(),
-        }),
-        name: if name.is_empty() {
-            "(Default)".into()
-        } else {
-            name.into()
-        },
-        source: format!(
-            "Registry {} {}{}",
-            if once { "RunOnce" } else { "Run" },
-            if view32 { "32-bit" } else { "64-bit" },
-            if !once && !can_toggle {
-                " (status unknown)"
+    let identity = Identity::Run {
+        machine,
+        view32,
+        once,
+        name: name.into(),
+    };
+    let executable = crate::icons::executable_from_command(&command);
+    let icon_index = executable.as_deref().and_then(crate::icons::for_file);
+    Ok(Some(ProgramEntry {
+        expand_environment: kind == REG_EXPAND_SZ,
+        working_directory: None,
+        entry: StartupEntry {
+            id: id(&identity),
+            origin: identity.origin(),
+            added_at: None,
+            executable,
+            icon_index,
+            name: if name.is_empty() {
+                "(Default)".into()
             } else {
-                ""
-            }
-        ),
-        location: format!("{}\\{path}", if machine { "HKLM" } else { "HKCU" }),
-        command,
-        enabled,
-        can_toggle,
+                name.into()
+            },
+            source: format!(
+                "Registry {} {}{}",
+                if once { "RunOnce" } else { "Run" },
+                if view32 { "32-bit" } else { "64-bit" },
+                if !once && !can_toggle {
+                    " (status unknown)"
+                } else {
+                    ""
+                }
+            ),
+            location: format!("{}\\{path}", if machine { "HKLM" } else { "HKCU" }),
+            command,
+            enabled,
+            can_toggle,
+        },
     }))
 }
 
@@ -482,6 +649,14 @@ fn folder_entry(
     path: &Path,
     snapshot: &mut StartupSnapshot,
 ) -> Result<StartupEntry, String> {
+    folder_program_entry(common, path, snapshot).map(|metadata| metadata.entry)
+}
+
+fn folder_program_entry(
+    common: bool,
+    path: &Path,
+    snapshot: &mut StartupSnapshot,
+) -> Result<ProgramEntry, String> {
     let metadata = fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if metadata.is_dir() || metadata.file_attributes() & 0x400 != 0 {
         return Err(format!(
@@ -494,32 +669,63 @@ fn folder_entry(
         .and_then(|name| name.to_str())
         .ok_or("Startup filename is not valid Unicode")?
         .to_string();
-    let command = if path
+    let (command, executable, working_directory) = if path
         .extension()
         .is_some_and(|x| x.eq_ignore_ascii_case("lnk"))
     {
-        tasks::shortcut_command(path)?
+        let metadata = tasks::shortcut_metadata(path)?;
+        (
+            metadata.command,
+            metadata.executable,
+            metadata.working_directory,
+        )
     } else {
-        format!("\"{}\"", path.display())
+        (
+            format!("\"{}\"", path.display()),
+            path.to_str().and_then(crate::icons::executable_path),
+            None,
+        )
     };
+    let after =
+        fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if metadata.file_size() != after.file_size()
+        || metadata.last_write_time() != after.last_write_time()
+        || metadata.creation_time() != after.creation_time()
+        || after.is_dir()
+        || after.file_attributes() & 0x400 != 0
+    {
+        return Err(
+            "Ярлык или файл автозагрузки изменился во время чтения; обновите список".into(),
+        );
+    }
     let (enabled, can_toggle) = approval_state(snapshot, common, "StartupFolder", &name);
-    Ok(StartupEntry {
-        id: id(&Identity::Folder {
-            common,
-            name: name.clone(),
-            size: metadata.file_size(),
-            modified: metadata.last_write_time(),
-        }),
-        name,
-        source: format!(
-            "Startup folder ({}){}",
-            if common { "all users" } else { "current user" },
-            if can_toggle { "" } else { " (status unknown)" }
-        ),
-        location: path.display().to_string(),
-        command,
-        enabled,
-        can_toggle,
+    let identity = Identity::Folder {
+        common,
+        name: name.clone(),
+        size: metadata.file_size(),
+        modified: metadata.last_write_time(),
+    };
+    let icon_index = executable.as_deref().and_then(crate::icons::for_file);
+    Ok(ProgramEntry {
+        expand_environment: false,
+        working_directory,
+        entry: StartupEntry {
+            id: id(&identity),
+            origin: identity.origin(),
+            added_at: None,
+            executable,
+            icon_index,
+            name,
+            source: format!(
+                "Startup folder ({}){}",
+                if common { "all users" } else { "current user" },
+                if can_toggle { "" } else { " (status unknown)" }
+            ),
+            location: path.display().to_string(),
+            command,
+            enabled,
+            can_toggle,
+        },
     })
 }
 
@@ -824,6 +1030,118 @@ fn scan_services(snapshot: &mut StartupSnapshot) {
     }
 }
 
+fn service_entry(
+    handle: &ServiceHandle,
+    name: &str,
+    display: &str,
+) -> Result<Option<StartupEntry>, String> {
+    let mut needed = 0;
+    let mut buffer = vec![0usize; 8192 / mem::size_of::<usize>()];
+    // SAFETY: aligned live buffer, query-capable owned service handle; documented maximum is 8 KiB.
+    if unsafe { QueryServiceConfigW(handle.0, buffer.as_mut_ptr().cast(), 8192, &mut needed) } == 0
+    {
+        return Err(format!(
+            "Не удалось прочитать настройки службы {name}: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: the successful query initialized the fixed header and string pointers inside buffer.
+    let config = unsafe { &*buffer.as_ptr().cast::<QUERY_SERVICE_CONFIGW>() };
+    if config.dwStartType != SERVICE_AUTO_START || config.dwServiceType & SERVICE_WIN32 == 0 {
+        return Ok(None);
+    }
+    // SAFETY: binary path remains owned by the live buffer until it is copied.
+    let command = unsafe { service_text(config.lpBinaryPathName) }?;
+    let identity = Identity::Service { name: name.into() };
+    let executable = crate::icons::executable_from_command(&command);
+    let icon_index = executable.as_deref().and_then(crate::icons::for_file);
+    Ok(Some(StartupEntry {
+        id: id(&identity),
+        origin: identity.origin(),
+        added_at: None,
+        executable,
+        icon_index,
+        name: if display.is_empty() {
+            name.into()
+        } else {
+            display.into()
+        },
+        source: "Automatic service (read-only)".into(),
+        location: format!(r"HKLM\SYSTEM\CurrentControlSet\Services\{name}"),
+        command,
+        enabled: true,
+        can_toggle: false,
+    }))
+}
+
+fn set_service_running(expected: &StartupEntry, name: &str, running: bool) -> Result<(), String> {
+    // SAFETY: null machine/database select the local SCM with connect-only access.
+    let manager = unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_CONNECT) };
+    if manager.is_null() {
+        return Err(format!(
+            "Не удалось открыть диспетчер служб: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let manager = ServiceHandle(manager);
+    let access = SERVICE_QUERY_CONFIG
+        | SERVICE_QUERY_STATUS
+        | if running { SERVICE_START } else { SERVICE_STOP };
+    // SAFETY: validated NUL-free service name, owned SCM handle; only the selected action's rights are requested.
+    let raw = unsafe { OpenServiceW(manager.0, wide(name).as_ptr(), access) };
+    if raw.is_null() {
+        return Err(format!(
+            "Не удалось открыть службу {name}: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let handle = ServiceHandle(raw);
+    let current = service_entry(&handle, name, &expected.name)?
+        .ok_or("Тип запуска или конфигурация службы изменились; обновите список")?;
+    validate_current_entry(expected, &current)?;
+    let mut status = SERVICE_STATUS_PROCESS::default();
+    let mut needed = 0;
+    // SAFETY: status is writable and correctly sized; the handle has SERVICE_QUERY_STATUS.
+    if unsafe {
+        QueryServiceStatusEx(
+            handle.0,
+            SC_STATUS_PROCESS_INFO,
+            (&mut status as *mut SERVICE_STATUS_PROCESS).cast(),
+            mem::size_of::<SERVICE_STATUS_PROCESS>() as u32,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(format!(
+            "Не удалось проверить состояние службы {name}: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    if !service_needs_control(&status, running)? {
+        return Ok(());
+    }
+    if running {
+        // SAFETY: start this exact verified service with its existing configuration; no extra arguments/config edits.
+        if unsafe { StartServiceW(handle.0, 0, ptr::null()) } == 0 {
+            return Err(format!(
+                "Не удалось запустить службу {name}: {}",
+                io::Error::last_os_error()
+            ));
+        }
+    } else {
+        crate::processes::validate_process_stop(status.dwProcessId)?;
+        let mut response = SERVICE_STATUS::default();
+        // SAFETY: sends STOP only to this exact service, never terminates its possibly shared host process.
+        if unsafe { ControlService(handle.0, SERVICE_CONTROL_STOP, &mut response) } == 0 {
+            return Err(format!(
+                "Не удалось остановить службу {name}: {}",
+                io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn scan_services_inner(snapshot: &mut StartupSnapshot) -> Result<(), String> {
     // SAFETY: null machine/database select the local active service database with read-only rights.
     let manager = unsafe {
@@ -903,41 +1221,11 @@ fn scan_services_inner(snapshot: &mut StartupSnapshot) -> Result<(), String> {
                 continue;
             }
             let handle = ServiceHandle(handle);
-            let mut config = vec![0usize; 8192 / mem::size_of::<usize>()];
-            // SAFETY: config is aligned and writable; QueryServiceConfigW documents an 8 KiB maximum.
-            let success = unsafe {
-                QueryServiceConfigW(handle.0, config.as_mut_ptr().cast(), 8192, &mut needed)
-            };
-            if success == 0 {
-                warn(
-                    snapshot,
-                    format!(
-                        "Read service configuration {name}: {}",
-                        io::Error::last_os_error()
-                    ),
-                );
-                continue;
+            match service_entry(&handle, &name, &display) {
+                Ok(Some(entry)) => snapshot.entries.push(entry),
+                Ok(None) => {}
+                Err(error) => warn(snapshot, error),
             }
-            // SAFETY: QueryServiceConfigW initialized the header at this aligned buffer's start.
-            let config = unsafe { &*config.as_ptr().cast::<QUERY_SERVICE_CONFIGW>() };
-            if config.dwStartType != SERVICE_AUTO_START {
-                continue;
-            }
-            // SAFETY: binary path points into the still-live query buffer.
-            let command = unsafe { service_text(config.lpBinaryPathName) }?;
-            snapshot.entries.push(StartupEntry {
-                id: id(&Identity::Service { name: name.clone() }),
-                name: if display.is_empty() {
-                    name.clone()
-                } else {
-                    display
-                },
-                source: "Automatic service (read-only)".into(),
-                location: format!(r"HKLM\SYSTEM\CurrentControlSet\Services\{name}"),
-                command,
-                enabled: true,
-                can_toggle: false,
-            });
         }
         if success != 0 {
             return Ok(());
@@ -1124,6 +1412,61 @@ pub fn watch_changes(stop: Arc<AtomicBool>, changed: Arc<AtomicBool>) -> thread:
 mod tests {
     use super::*;
 
+    #[test]
+    fn origin_is_derived_from_typed_identity_and_actual_task_parent() {
+        assert_eq!(
+            Identity::Run {
+                machine: true,
+                view32: true,
+                once: true,
+                name: "opaque display".into()
+            }
+            .origin(),
+            StartupOrigin::Registry {
+                machine: true,
+                view32: true,
+                once: true
+            }
+        );
+        assert_eq!(
+            Identity::Folder {
+                common: false,
+                name: "entry.lnk".into(),
+                size: 1,
+                modified: 2
+            }
+            .origin(),
+            StartupOrigin::Folder { common: false }
+        );
+        assert_eq!(
+            Identity::Task {
+                path: r"\Vendor\Subfolder\Task".into(),
+                definition: "token".into()
+            }
+            .origin(),
+            StartupOrigin::Task {
+                folder: r"\Vendor\Subfolder".into()
+            }
+        );
+        assert_eq!(
+            Identity::Task {
+                path: r"\Root task".into(),
+                definition: "token".into()
+            }
+            .origin(),
+            StartupOrigin::Task {
+                folder: r"\".into()
+            }
+        );
+        assert_eq!(
+            Identity::Service {
+                name: "service".into()
+            }
+            .origin(),
+            StartupOrigin::Service
+        );
+    }
+
     fn entry(command: &str) -> StartupEntry {
         StartupEntry {
             id: "identity".into(),
@@ -1133,7 +1476,49 @@ mod tests {
             command: command.into(),
             enabled: true,
             can_toggle: true,
+            added_at: None,
+            icon_index: None,
+            executable: None,
+            origin: StartupOrigin::Registry {
+                machine: false,
+                view32: false,
+                once: false,
+            },
         }
+    }
+
+    #[test]
+    fn startup_runtime_freshness_is_independent_of_approval_and_readonly_toggle_flags() {
+        let mut expected = entry("app.exe --same");
+        expected.can_toggle = false;
+        let mut current = expected.clone();
+        current.enabled = false;
+        current.icon_index = Some(42);
+        current.executable = Some("metadata changed".into());
+        assert!(validate_current_entry(&expected, &current).is_ok());
+        current.command = "app.exe --different".into();
+        assert!(validate_current_entry(&expected, &current).is_err());
+        current.command = expected.command.clone();
+        current.id = "replaced identity".into();
+        assert!(validate_current_entry(&expected, &current).is_err());
+    }
+
+    #[test]
+    fn startup_service_requests_respect_states_and_accepted_stop_control() {
+        let mut status = SERVICE_STATUS_PROCESS {
+            dwCurrentState: SERVICE_STOPPED,
+            ..SERVICE_STATUS_PROCESS::default()
+        };
+        assert!(!service_needs_control(&status, false).unwrap());
+        assert!(service_needs_control(&status, true).unwrap());
+        status.dwCurrentState = SERVICE_RUNNING;
+        assert!(!service_needs_control(&status, true).unwrap());
+        assert!(service_needs_control(&status, false).is_err());
+        status.dwControlsAccepted = SERVICE_ACCEPT_STOP;
+        assert!(service_needs_control(&status, false).unwrap());
+        status.dwCurrentState = SERVICE_STOP_PENDING;
+        assert!(!service_needs_control(&status, false).unwrap());
+        assert!(service_needs_control(&status, true).is_err());
     }
 
     #[test]
