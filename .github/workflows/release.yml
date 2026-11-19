@@ -1,4 +1,5 @@
 name: Release
+run-name: Release ${{ inputs.tag || github.ref_name }}
 
 on:
   push:
@@ -50,7 +51,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo clippy --locked --all-targets -- -D warnings
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked
+          # The hosted Windows runner uses elevated Explorer. These fixtures need an unelevated desktop shell.
+          $testArgs = @(
+              'test', '--locked', '--',
+              '--skip', 'processes::startup_program::tests::desktop_primary_token_is_read_only_unelevated_and_in_our_session',
+              '--skip', 'processes::startup_program::tests::expandable_values_use_the_desktop_user_environment_but_reg_sz_stays_raw',
+              '--skip', 'processes::startup_program::tests::shortcut_start_in_directory_is_expanded_validated_and_not_silently_discarded'
+          )
+          cargo @testArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\scripts\test-sensor-protocol.ps1
 
