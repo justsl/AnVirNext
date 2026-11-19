@@ -2,6 +2,7 @@
 /dist/
 /vendor/
 /work/
+/.idea/
 /.superpowers/
 /.impeccable/review/
 *.user

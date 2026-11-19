@@ -2104,9 +2104,7 @@ impl Ui {
                     &self.sensor,
                     &self.shared.current_settings(),
                 );
-                self.shared
-                    .disk_hovered
-                    .store(tray.disk_tooltip_open(), Ordering::Release);
+                self.shared.set_tray_hover(tray.hovered_metric());
             }
             let visible = update_visibility(self.hwnd, &self.shared);
             if visible {
@@ -2334,8 +2332,8 @@ unsafe fn execute_effect(hwnd: HWND, shared: &Shared, effect: Effect) {
                     ui.tray.take()
                 });
                 if let Some(mut tray) = tray {
-                    tray.close_disk_tooltip();
-                    shared.disk_hovered.store(false, Ordering::Release);
+                    tray.close_tooltip();
+                    shared.set_tray_hover(None);
                     let action = tray.settings_menu(hwnd, shared);
                     if IsWindow(hwnd) == 0 {
                         return;
@@ -2568,13 +2566,11 @@ unsafe extern "system" fn procedure(
             WM_SAMPLE_UPDATED => {
                 effect = ui.refresh(false);
             }
-            WM_TIMER if wparam == crate::tray::DISK_HOVER_TIMER => {
+            WM_TIMER if wparam == crate::tray::TRAY_HOVER_TIMER => {
                 let ui = &mut *ui;
                 if let Some(tray) = &mut ui.tray {
-                    tray.disk_hover_tick(&ui.snapshot);
-                    ui.shared
-                        .disk_hovered
-                        .store(tray.disk_tooltip_open(), Ordering::Release);
+                    tray.hover_tick(&ui.snapshot);
+                    ui.shared.set_tray_hover(tray.hovered_metric());
                 }
             }
             WM_TIMER => {
@@ -2734,10 +2730,8 @@ unsafe extern "system" fn procedure(
             crate::tray::WM_TRAY => {
                 let ui = &mut *ui;
                 if let Some(tray) = &mut ui.tray {
-                    tray.disk_hover_event(lparam, &ui.snapshot);
-                    ui.shared
-                        .disk_hovered
-                        .store(tray.disk_tooltip_open(), Ordering::Release);
+                    tray.hover_event(lparam, &ui.snapshot);
+                    ui.shared.set_tray_hover(tray.hovered_metric());
                 }
                 match lparam as u32 & 0xffff {
                     WM_LBUTTONUP | NIN_SELECT | NIN_KEYSELECT_NOTIFICATION => {

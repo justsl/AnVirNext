@@ -1,5 +1,6 @@
 //! Owned real-time kernel ETW activity; no packet contents, ETL files or generic-I/O estimates.
 
+use crate::metrics::PhysicalAddresses;
 use crate::model::counter_rate;
 use crate::win::{Handle, filetime, wide};
 use std::{
@@ -7,6 +8,7 @@ use std::{
     ffi::c_void,
     io,
     mem::{offset_of, size_of},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     ptr,
     sync::{
         Arc, Mutex,
@@ -59,6 +61,8 @@ pub struct ProcessRates {
     pub network_send: Option<f64>,
     pub disk_read: Option<f64>,
     pub disk_write: Option<f64>,
+    pub external_receive: Option<f64>,
+    pub external_send: Option<f64>,
 }
 
 type Identity = (u32, u64);
@@ -108,6 +112,9 @@ struct Counters {
     read: u64,
     write: u64,
     generation: u64,
+    external_receive: u64,
+    external_send: u64,
+    external_generation: u64,
 }
 
 fn u32_at(data: &[u8], offset: usize) -> Result<u32, &'static str> {
@@ -129,6 +136,33 @@ fn pointer_at(data: &[u8], offset: usize, pointer: usize) -> Result<u64, &'stati
         )),
         _ => Err("unsupported pointer width"),
     }
+}
+
+fn network_addresses(opcode: u8, data: &[u8]) -> Result<(IpAddr, IpAddr), &'static str> {
+    if matches!(opcode, 10 | 11) {
+        if data.len() < 20 {
+            return Err("truncated IPv4 endpoint prefix");
+        }
+        return Ok((
+            IpAddr::V4(Ipv4Addr::from(
+                <[u8; 4]>::try_from(&data[8..12]).map_err(|_| "invalid IPv4 address")?,
+            )),
+            IpAddr::V4(Ipv4Addr::from(
+                <[u8; 4]>::try_from(&data[12..16]).map_err(|_| "invalid IPv4 address")?,
+            )),
+        ));
+    }
+    if !matches!(opcode, 26 | 27) || data.len() < 44 {
+        return Err("unsupported/truncated IPv6 endpoint prefix");
+    }
+    Ok((
+        IpAddr::V6(Ipv6Addr::from(
+            <[u8; 16]>::try_from(&data[8..24]).map_err(|_| "invalid IPv6 address")?,
+        )),
+        IpAddr::V6(Ipv6Addr::from(
+            <[u8; 16]>::try_from(&data[24..40]).map_err(|_| "invalid IPv6 address")?,
+        )),
+    ))
 }
 
 fn decode(
@@ -223,6 +257,12 @@ fn rates(old: Counters, new: Counters, elapsed: Duration) -> ProcessRates {
         network_send: counter_rate(old.send, new.send, elapsed),
         disk_read: counter_rate(old.read, new.read, elapsed),
         disk_write: counter_rate(old.write, new.write, elapsed),
+        external_receive: (old.external_generation == new.external_generation)
+            .then(|| counter_rate(old.external_receive, new.external_receive, elapsed))
+            .flatten(),
+        external_send: (old.external_generation == new.external_generation)
+            .then(|| counter_rate(old.external_send, new.external_send, elapsed))
+            .flatten(),
     }
 }
 
@@ -264,8 +304,75 @@ struct Aggregate {
     network_seen: bool,
     disk_seen: bool,
     last_schema_error: Option<String>,
+    network_scope: Option<PhysicalAddresses>,
+    external_generation: u64,
+    external_started: u64,
+    external_issues: u64,
+    diagnostic_pid: Option<u32>,
+    endpoint_protocols: u8,
 }
 impl Aggregate {
+    fn external_scope_ready(&self) -> bool {
+        self.endpoint_protocols != 0
+            && self
+                .network_scope
+                .as_ref()
+                .is_some_and(|scope| !scope.physical.is_empty())
+    }
+    fn set_scope(&mut self, scope: Option<PhysicalAddresses>, now: u64) -> bool {
+        if self.network_scope == scope {
+            return false;
+        }
+        self.network_scope = scope;
+        self.external_started = now;
+        self.external_generation = self.external_generation.wrapping_add(1);
+        self.external_issues = 0;
+        self.endpoint_protocols = 0;
+        for counters in self.totals.values_mut() {
+            counters.external_receive = 0;
+            counters.external_send = 0;
+        }
+        true
+    }
+    fn external_event(&mut self, event: Event, timestamp: u64, addresses: (IpAddr, IpAddr)) {
+        let Event::Network {
+            pid,
+            bytes,
+            receive,
+        } = event
+        else {
+            return;
+        };
+        if timestamp < self.external_started
+            || !self
+                .network_scope
+                .as_ref()
+                .is_some_and(|scope| scope.allows(addresses.0, addresses.1))
+        {
+            return;
+        }
+        let Some(owner) = self.owner(pid, timestamp) else {
+            self.external_issues = self.external_issues.saturating_add(1);
+            return;
+        };
+        let Some(counter) = self.totals.get_mut(&owner) else {
+            self.external_issues = self.external_issues.saturating_add(1);
+            return;
+        };
+        let target = if receive {
+            &mut counter.external_receive
+        } else {
+            &mut counter.external_send
+        };
+        match target.checked_add(u64::from(bytes)) {
+            Some(value) => *target = value,
+            None => {
+                *target = 0;
+                self.external_generation = self.external_generation.wrapping_add(1);
+                self.external_issues = self.external_issues.saturating_add(1);
+            }
+        }
+    }
     fn install(&mut self, identity: Identity) {
         if identity.1 == 0 {
             return;
@@ -435,6 +542,7 @@ impl Aggregate {
     fn counters(&self, identity: Identity) -> Option<Counters> {
         self.totals.get(&identity).map(|counter| Counters {
             generation: self.generation,
+            external_generation: self.external_generation,
             ..*counter
         })
     }
@@ -712,21 +820,17 @@ unsafe extern "system" fn event_callback(record: *mut EVENT_RECORD) {
     } else {
         8
     };
+    let data = if record.UserData.is_null() || record.UserDataLength == 0 {
+        &[]
+    } else {
+        // SAFETY: ETW owns this non-null payload with its advertised readable length for this callback.
+        unsafe {
+            std::slice::from_raw_parts(record.UserData.cast::<u8>(), record.UserDataLength as usize)
+        }
+    };
     let result = if record.UserData.is_null() && record.UserDataLength != 0 {
         Err("null ETW payload")
     } else {
-        // SAFETY: ETW guarantees UserDataLength readable bytes for the duration of this callback; zero-length null is handled separately.
-        let data = if record.UserDataLength == 0 {
-            &[]
-        } else {
-            // SAFETY: ETW owns this non-null payload with the advertised readable length for this callback.
-            unsafe {
-                std::slice::from_raw_parts(
-                    record.UserData.cast::<u8>(),
-                    record.UserDataLength as usize,
-                )
-            }
-        };
         decode(
             provider,
             header.EventDescriptor.Version,
@@ -736,10 +840,49 @@ unsafe extern "system" fn event_callback(record: *mut EVENT_RECORD) {
         )
     };
     match result {
-        Ok(Some(event)) if header.TimeStamp > 0 => aggregate.event(event, header.TimeStamp as u64),
+        Ok(Some(event)) if header.TimeStamp > 0 => {
+            aggregate.event(event, header.TimeStamp as u64);
+            if matches!(event, Event::Network { .. })
+                && aggregate.network_scope.is_some()
+                && header.TimeStamp as u64 >= aggregate.external_started
+            {
+                match network_addresses(header.EventDescriptor.Opcode, data) {
+                    Ok(addresses) => {
+                        if aggregate.diagnostic_pid.is_none() {
+                            // Normal hover needs only one post-scope schema confirmation, not per-protocol diagnostics.
+                            if aggregate.endpoint_protocols == 0 {
+                                aggregate.endpoint_protocols = 1;
+                            }
+                        } else if matches!(event, Event::Network { pid, .. } if Some(pid) == aggregate.diagnostic_pid)
+                            && addresses.0.is_loopback()
+                            && addresses.1.is_loopback()
+                        {
+                            let protocol = if provider == Provider::Udp { 4 } else { 0 };
+                            let family = if header.EventDescriptor.Opcode >= 26 {
+                                2
+                            } else {
+                                0
+                            };
+                            let receive =
+                                u8::from(matches!(header.EventDescriptor.Opcode, 11 | 27));
+                            aggregate.endpoint_protocols |= 1 << (protocol + family + receive);
+                        }
+                        aggregate.external_event(event, header.TimeStamp as u64, addresses)
+                    }
+                    Err(_) => {
+                        aggregate.external_issues = aggregate.external_issues.saturating_add(1)
+                    }
+                }
+            }
+        }
         Ok(None) => {}
         _ => {
             aggregate.issues.malformed = aggregate.issues.malformed.saturating_add(1);
+            if matches!(provider, Provider::Tcp | Provider::Udp)
+                && aggregate.network_scope.is_some()
+            {
+                aggregate.external_issues = aggregate.external_issues.saturating_add(1);
+            }
             if aggregate.last_schema_error.is_none() {
                 aggregate.last_schema_error = Some(format!(
                     "{provider:?} version {} opcode {} length {}: {}",
@@ -983,6 +1126,9 @@ pub struct ActivityMonitor {
     observed_issues: Issues,
     recent_partial: bool,
     recent_loss: bool,
+    external_ready: bool,
+    observed_external_issues: u64,
+    external_partial: bool,
 }
 impl Default for ActivityMonitor {
     fn default() -> Self {
@@ -1007,6 +1153,9 @@ impl ActivityMonitor {
             observed_issues: Issues::default(),
             recent_partial: false,
             recent_loss: false,
+            external_ready: false,
+            observed_external_issues: 0,
+            external_partial: false,
         }
     }
     pub fn sample(
@@ -1108,10 +1257,22 @@ impl ActivityMonitor {
                     value.disk_read = None;
                     value.disk_write = None;
                 }
+                if !aggregate.external_scope_ready() {
+                    value.external_receive = None;
+                    value.external_send = None;
+                }
                 previous.insert(identity, current);
             }
             result.insert(identity, value);
         }
+        self.external_ready = aggregate.external_scope_ready()
+            && elapsed.is_some()
+            && self
+                .previous
+                .values()
+                .any(|previous| previous.external_generation == aggregate.external_generation);
+        self.external_partial = aggregate.external_issues > self.observed_external_issues;
+        self.observed_external_issues = aggregate.external_issues;
         self.previous = previous;
         let issues = aggregate.issues;
         self.recent_loss = issues.lost > self.observed_issues.lost
@@ -1125,6 +1286,55 @@ impl ActivityMonitor {
     }
     pub fn status(&self) -> Option<String> {
         self.status_for(true)
+    }
+
+    pub(crate) fn set_network_scope(&mut self, scope: Option<PhysicalAddresses>) {
+        if let Ok(mut aggregate) = self.shared.aggregate.lock() {
+            if aggregate.set_scope(scope, now_filetime()) {
+                self.external_ready = false;
+                self.observed_external_issues = 0;
+                self.external_partial = false;
+            }
+        }
+    }
+
+    pub(crate) fn network_status(&self) -> Option<String> {
+        if self.failure.is_some() || self.session.is_none() {
+            return Some(
+                if self
+                    .failure
+                    .as_ref()
+                    .is_some_and(|error| error.contains("as administrator"))
+                {
+                    "Сеть по процессам недоступна: нужны права администратора"
+                } else {
+                    "Данные сети по процессам недоступны"
+                }
+                .into(),
+            );
+        }
+        if self.shared.done.load(Ordering::Acquire) {
+            return Some("Данные сети по процессам недоступны".into());
+        }
+        let Ok(aggregate) = self.shared.aggregate.lock() else {
+            return Some("Данные сети по процессам недоступны".into());
+        };
+        let Some(scope) = &aggregate.network_scope else {
+            return Some("Адреса физических адаптеров недоступны".into());
+        };
+        if scope.physical.is_empty() {
+            return Some("Нет активных физических сетевых адресов".into());
+        }
+        if self.recent_loss || self.external_partial {
+            return Some("Часть сетевых данных недоступна".into());
+        }
+        if !self.external_ready {
+            return Some("Ожидание данных физической сети".into());
+        }
+        if !self.denied.is_empty() {
+            return Some("Статистика части системных процессов недоступна".into());
+        }
+        None
     }
 
     pub(crate) fn disk_status(&self) -> Option<String> {
@@ -1326,6 +1536,14 @@ pub fn diagnose_activity() -> String {
     };
     let initial: Vec<_> = identities().collect();
     let pid = std::process::id();
+    let mut metrics = crate::metrics::Metrics::default();
+    metrics.sample();
+    // Explicit diagnostic observes only local sockets; physical scope must reject those transfers.
+    monitor.set_network_scope(metrics.physical_addresses());
+    if let Ok(mut aggregate) = monitor.shared.aggregate.lock() {
+        aggregate.diagnostic_pid = Some(pid);
+        aggregate.endpoint_protocols = 0;
+    }
     let Some(identity) = initial.iter().copied().find(|&(current, _)| current == pid) else {
         return "ETW fixture failed: current native process identity unavailable".into();
     };
@@ -1359,11 +1577,24 @@ pub fn diagnose_activity() -> String {
     let sent_bytes = after.send.saturating_sub(before.send);
     // Each local TCP echo accounts for 2 MiB in each direction to this same process.
     // Both families must be visible; UDP-only traffic must never make this diagnostic pass.
+    let (protocols, external_bytes, scope_available) = monitor
+        .shared
+        .aggregate
+        .lock()
+        .map(|aggregate| {
+            (
+                aggregate.endpoint_protocols,
+                after.external_receive.saturating_add(after.external_send),
+                aggregate.network_scope.is_some(),
+            )
+        })
+        .unwrap_or((0, 0, false));
     let passed = disk.is_ok()
         && ipv4.is_ok()
         && ipv6.is_ok()
         && received_bytes >= 4 * 1024 * 1024
         && sent_bytes >= 4 * 1024 * 1024
+        && (!scope_available || (external_bytes == 0 && protocols == u8::MAX))
         && [
             measured.network_receive,
             measured.network_send,
@@ -1387,7 +1618,7 @@ pub fn diagnose_activity() -> String {
         })
         .unwrap_or_else(|_| "aggregator poisoned".into());
     format!(
-        "ETW fixture {}: pid={}, receive={:?} B/s, send={:?} B/s, disk_read={:?} B/s, disk_write={:?} B/s; received_bytes={received_bytes}, sent_bytes={sent_bytes}; disk={disk:?}; IPv4={ipv4:?}; IPv6={ipv6:?}; {diagnostics}; status={:?}",
+        "ETW fixture {}: pid={}, receive={:?} B/s, send={:?} B/s, disk_read={:?} B/s, disk_write={:?} B/s; received_bytes={received_bytes}, sent_bytes={sent_bytes}; loopback_protocols={protocols:#04x}, physical_scope={scope_available}, external_loopback_bytes={external_bytes}; disk={disk:?}; IPv4={ipv4:?}; IPv6={ipv6:?}; {diagnostics}; status={:?}",
         if passed { "passed" } else { "failed" },
         pid,
         measured.network_receive,
@@ -1408,6 +1639,99 @@ mod tests {
             bytes,
             receive,
         }
+    }
+
+    fn physical_scope(address: &str) -> PhysicalAddresses {
+        let address: IpAddr = address.parse().unwrap();
+        PhysicalAddresses {
+            physical: HashSet::from([address]),
+            local: HashSet::from([address]),
+            broadcast: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn activity_network_endpoint_prefix_uses_network_order_for_both_families_and_directions() {
+        for opcode in [10, 11, 26, 27] {
+            let mut bytes = vec![0u8; if opcode >= 26 { 44 } else { 20 }];
+            let expected = if opcode >= 26 {
+                let a: Ipv6Addr = "2001:db8::1".parse().unwrap();
+                let b: Ipv6Addr = "2001:db8::2".parse().unwrap();
+                bytes[8..24].copy_from_slice(&a.octets());
+                bytes[24..40].copy_from_slice(&b.octets());
+                (IpAddr::V6(a), IpAddr::V6(b))
+            } else {
+                bytes[8..12].copy_from_slice(&[192, 0, 2, 1]);
+                bytes[12..16].copy_from_slice(&[198, 51, 100, 2]);
+                (
+                    "192.0.2.1".parse().unwrap(),
+                    "198.51.100.2".parse().unwrap(),
+                )
+            };
+            assert_eq!(network_addresses(opcode, &bytes).unwrap(), expected);
+            assert!(network_addresses(opcode, &bytes[..bytes.len() - 1]).is_err());
+        }
+    }
+
+    #[test]
+    fn activity_external_scope_reset_does_not_reset_all_interface_or_disk_baselines() {
+        let mut aggregate = Aggregate::default();
+        aggregate.install((42, 100));
+        aggregate.set_scope(Some(physical_scope("192.0.2.1")), 200);
+        let endpoints = (
+            "192.0.2.1".parse().unwrap(),
+            "198.51.100.2".parse().unwrap(),
+        );
+        let old = aggregate.counters((42, 100)).unwrap();
+        aggregate.event(net(42, 100, false), 250);
+        aggregate.external_event(net(42, 100, false), 250, endpoints);
+        let new = aggregate.counters((42, 100)).unwrap();
+        assert_eq!(
+            rates(old, new, Duration::from_secs(1)).external_send,
+            Some(100.)
+        );
+        aggregate.set_scope(Some(physical_scope("192.0.2.2")), 300);
+        aggregate.event(net(42, 200, false), 350);
+        let reset = aggregate.counters((42, 100)).unwrap();
+        let values = rates(new, reset, Duration::from_secs(1));
+        assert_eq!(values.network_send, Some(200.));
+        assert_eq!(values.disk_read, Some(0.));
+        assert_eq!(values.external_send, None);
+        assert!(!aggregate.set_scope(Some(physical_scope("192.0.2.2")), 400));
+    }
+
+    #[test]
+    fn activity_external_scope_excludes_delayed_events_and_counts_receive_by_opcode() {
+        let mut aggregate = Aggregate::default();
+        aggregate.install((42, 100));
+        aggregate.set_scope(Some(physical_scope("192.0.2.1")), 300);
+        let endpoints = (
+            "198.51.100.2".parse().unwrap(),
+            "192.0.2.1".parse().unwrap(),
+        );
+        aggregate.external_event(net(42, 999, true), 250, endpoints);
+        aggregate.external_event(net(42, 100, true), 350, endpoints);
+        aggregate.external_event(net(42, 200, false), 360, endpoints);
+        assert_eq!(aggregate.counters((42, 100)).unwrap().external_receive, 100);
+        assert_eq!(aggregate.counters((42, 100)).unwrap().external_send, 200);
+        aggregate.set_scope(None, 400);
+        aggregate.external_event(net(42, 999, true), 450, endpoints);
+        assert_eq!(aggregate.counters((42, 100)).unwrap().external_receive, 0);
+    }
+
+    #[test]
+    fn activity_external_scope_requires_nonempty_addresses_and_post_scope_schema_evidence() {
+        let mut aggregate = Aggregate::default();
+        aggregate.set_scope(Some(PhysicalAddresses::default()), 100);
+        assert!(!aggregate.external_scope_ready());
+        aggregate.endpoint_protocols = u8::MAX;
+        assert!(!aggregate.external_scope_ready());
+        aggregate.set_scope(Some(physical_scope("192.0.2.1")), 200);
+        assert!(!aggregate.external_scope_ready());
+        aggregate.endpoint_protocols = 1;
+        assert!(aggregate.external_scope_ready());
+        aggregate.set_scope(Some(physical_scope("192.0.2.2")), 300);
+        assert!(!aggregate.external_scope_ready());
     }
 
     #[test]
@@ -1575,6 +1899,7 @@ mod tests {
             read: 30,
             write: 40,
             generation: 1,
+            ..Counters::default()
         };
         let new = Counters {
             receive: 30,
@@ -1582,6 +1907,7 @@ mod tests {
             read: 90,
             write: 120,
             generation: 1,
+            ..Counters::default()
         };
         let value = rates(old, new, Duration::from_secs(2));
         assert_eq!(value.network_receive, Some(10.));

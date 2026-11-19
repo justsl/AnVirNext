@@ -1,7 +1,7 @@
 use crate::{
     activity::{ActivityMonitor, ProcessRates},
     metrics::{Metrics, SystemSample},
-    model::History,
+    model::{History, ProcessTimes, process_cpu},
     process_rules::{ProcessRule, RuleBook},
     processes::{self, ProcessDetails, ProcessRow, ProcessSampler, StartupRuntimeOutcome},
     sensors::{self, SensorState},
@@ -10,7 +10,7 @@ use crate::{
     win::Notifier,
 };
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -29,7 +29,7 @@ pub struct ViewSnapshot {
     pub processes: Arc<Vec<ProcessRow>>,
     pub process_error: Option<String>,
     pub activity_error: Option<String>,
-    pub(crate) disk_top: Option<Arc<DiskTop>>,
+    tray_top: Option<(TrayMetric, Arc<ProcessTop>)>,
     pub updated: Instant,
 }
 
@@ -41,37 +41,88 @@ impl Default for ViewSnapshot {
             processes: Arc::new(Vec::new()),
             process_error: None,
             activity_error: None,
-            disk_top: None,
+            tray_top: None,
             updated: Instant::now(),
         }
     }
 }
 
+impl ViewSnapshot {
+    pub(crate) fn tray_process_top(&self, metric: TrayMetric) -> Option<&ProcessTop> {
+        let (current, top) = self.tray_top.as_ref()?;
+        (*current == metric).then_some(top.as_ref())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub(crate) enum TrayMetric {
+    Cpu = 1,
+    Memory = 2,
+    Network = 3,
+    Disk = 4,
+}
+
+impl TrayMetric {
+    pub(crate) fn from_icon_index(index: usize) -> Option<Self> {
+        [Self::Cpu, Self::Memory, Self::Network, Self::Disk]
+            .into_iter()
+            .find(|metric| *metric as usize == index)
+    }
+
+    fn uses_activity(self) -> bool {
+        matches!(self, Self::Network | Self::Disk)
+    }
+
+    fn values(
+        self,
+        cpu: Option<f64>,
+        memory: Option<u64>,
+        rates: ProcessRates,
+    ) -> [Option<f64>; 2] {
+        match self {
+            Self::Cpu => [cpu, None],
+            Self::Memory => [memory.map(|value| value as f64), None],
+            Self::Network => [rates.external_receive, rates.external_send],
+            Self::Disk => [rates.disk_read, rates.disk_write],
+        }
+    }
+
+    fn activity_status(self, activity: Option<&ActivityMonitor>) -> Option<String> {
+        match self {
+            Self::Network => activity.and_then(ActivityMonitor::network_status),
+            Self::Disk => activity.and_then(ActivityMonitor::disk_status),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug)]
-pub(crate) struct DiskProcess {
+pub(crate) struct LeadingProcess {
     pub pid: u32,
     pub name: String,
     pub rate: f64,
 }
 
 #[derive(Debug)]
-pub(crate) struct DiskTop {
+pub(crate) struct ProcessTop {
     pub measured_at: Instant,
-    pub directions: [Option<Vec<DiskProcess>>; 2],
+    pub directions: [Option<Vec<LeadingProcess>>; 2],
     pub status: Option<String>,
 }
 
-fn rank_disk<'a>(
-    rows: impl IntoIterator<Item = (u32, &'a str, ProcessRates)>,
+fn rank_processes<'a>(
+    rows: impl IntoIterator<Item = (u32, &'a str, [Option<f64>; 2])>,
     status: Option<String>,
-) -> DiskTop {
+) -> ProcessTop {
     const TOP: usize = 3;
     let mut directions = [None::<Vec<(u32, &str, f64)>>, None];
-    for (pid, name, rates) in rows {
-        for (direction, rate) in directions
-            .iter_mut()
-            .zip([rates.disk_read, rates.disk_write])
-        {
+    for (pid, name, values) in rows {
+        // The idle pseudo-process reports unused CPU time as its utilization.
+        if pid == 0 {
+            continue;
+        }
+        for (direction, rate) in directions.iter_mut().zip(values) {
             let Some(rate) = rate.filter(|rate| rate.is_finite() && *rate >= 0.0) else {
                 continue;
             };
@@ -89,12 +140,12 @@ fn rank_disk<'a>(
             }
         }
     }
-    DiskTop {
+    ProcessTop {
         measured_at: Instant::now(),
         directions: directions.map(|direction| {
             direction.map(|top| {
                 top.into_iter()
-                    .map(|(pid, name, rate)| DiskProcess {
+                    .map(|(pid, name, rate)| LeadingProcess {
                         pid,
                         name: name.into(),
                         rate,
@@ -111,26 +162,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn disk_summary_ranks_read_and_write_independently_and_distinguishes_idle_from_unknown() {
+    fn ranking_keeps_directions_independent_and_excludes_the_idle_process() {
         let rows = [
+            (0, Some(99.0), Some(20.0)),
             (5, Some(8.0), Some(0.0)),
             (9, Some(8.0), Some(3.0)),
             (2, None, Some(20.0)),
             (4, Some(10.0), None),
             (1, Some(2.0), None),
         ];
-        let top = rank_disk(
-            rows.map(|(pid, disk_read, disk_write)| {
-                (
-                    pid,
-                    "fixture",
-                    ProcessRates {
-                        disk_read,
-                        disk_write,
-                        ..Default::default()
-                    },
-                )
-            }),
+        let top = rank_processes(
+            rows.map(|(pid, read, write)| (pid, "fixture", [read, write])),
             None,
         );
         assert_eq!(
@@ -151,19 +193,35 @@ mod tests {
                 .collect::<Vec<_>>(),
             [2, 9]
         );
-        let idle = rank_disk(
-            [(
-                5,
-                "fixture",
-                ProcessRates {
-                    disk_read: Some(0.0),
-                    ..Default::default()
-                },
-            )],
-            None,
-        );
+        let idle = rank_processes([(5, "fixture", [Some(0.0), None])], None);
         assert!(idle.directions[0].as_ref().unwrap().is_empty());
         assert!(idle.directions[1].is_none());
+    }
+
+    #[test]
+    fn network_hover_uses_only_external_rates_and_cpu_memory_need_no_activity_trace() {
+        let rates = ProcessRates {
+            network_receive: Some(900.0),
+            network_send: Some(800.0),
+            external_receive: Some(90.0),
+            external_send: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            TrayMetric::Network.values(None, None, rates),
+            [Some(90.0), None]
+        );
+        assert_eq!(
+            TrayMetric::Cpu.values(Some(2.5), None, rates),
+            [Some(2.5), None]
+        );
+        assert_eq!(
+            TrayMetric::Memory.values(None, Some(4_294_967_296), rates),
+            [Some(4_294_967_296.0), None]
+        );
+        assert!(!TrayMetric::Cpu.uses_activity());
+        assert!(!TrayMetric::Memory.uses_activity());
+        assert!(TrayMetric::Network.uses_activity() && TrayMetric::Disk.uses_activity());
     }
 }
 
@@ -235,7 +293,7 @@ pub struct Shared {
     pub rules: Mutex<Option<RuleBook>>,
     pub settings: Mutex<Settings>,
     pub visible: AtomicBool,
-    pub(crate) disk_hovered: AtomicBool,
+    tray_hover: AtomicUsize,
     /// 0 processes, 1 autostart, 2 sensors, 3 saved process rules.
     pub active_tab: AtomicUsize,
     pub stop: Arc<AtomicBool>,
@@ -262,7 +320,7 @@ impl Shared {
             rules: Mutex::new(rule_result.ok()),
             settings: Mutex::new(settings),
             visible: AtomicBool::new(false),
-            disk_hovered: AtomicBool::new(false),
+            tray_hover: AtomicUsize::new(0),
             active_tab: AtomicUsize::new(0),
             stop: Arc::new(AtomicBool::new(false)),
             notifier: Arc::new(Notifier::default()),
@@ -401,6 +459,13 @@ impl Shared {
             .unwrap_or_else(|poison| poison.into_inner())
             .clone()
     }
+
+    pub(crate) fn set_tray_hover(&self, metric: Option<TrayMetric>) {
+        self.tray_hover.store(
+            metric.map_or(0, |metric| metric as usize),
+            Ordering::Release,
+        );
+    }
     pub fn saved_rules(&self) -> Vec<ProcessRule> {
         self.rules
             .lock()
@@ -447,7 +512,9 @@ fn collect(shared: Arc<Shared>) {
     let mut metrics = Metrics::default();
     let mut processes = ProcessSampler::default();
     let mut activity: Option<ActivityMonitor> = None;
-    let mut last_activity = None::<Instant>;
+    let mut network_scope_requested = false;
+    let mut last_tray_sample = None::<(TrayMetric, Instant)>;
+    let mut compact_cpu = None;
     let mut last_processes = Instant::now() - Duration::from_secs(3);
     let mut last_system = Instant::now() - Duration::from_secs(6);
     let mut system = SystemSample::default();
@@ -479,35 +546,66 @@ fn collect(shared: Arc<Shared>) {
             .is_some_and(RuleBook::has_rules);
         let processes_visible = shared.visible.load(Ordering::Acquire)
             && shared.active_tab.load(Ordering::Relaxed) == 0;
-        let disk_hovered = shared.disk_hovered.load(Ordering::Acquire);
-        if processes_visible || disk_hovered {
-            activity.get_or_insert_with(ActivityMonitor::new);
+        let hovered = TrayMetric::from_icon_index(shared.tray_hover.load(Ordering::Acquire));
+        if hovered != Some(TrayMetric::Cpu) || processes_visible {
+            compact_cpu = None;
+        }
+        if processes_visible || hovered.is_some_and(TrayMetric::uses_activity) {
+            let activity = activity.get_or_insert_with(ActivityMonitor::new);
+            let wants_network_scope = hovered == Some(TrayMetric::Network);
+            if wants_network_scope != network_scope_requested
+                || (wants_network_scope && system_changed)
+            {
+                activity.set_network_scope(if wants_network_scope {
+                    metrics.physical_addresses()
+                } else {
+                    None
+                });
+                network_scope_requested = wants_network_scope;
+            }
         } else {
             activity = None;
-            last_activity = None;
+            network_scope_requested = false;
         }
         let processes_needed = processes_visible || has_rules;
-        let mut disk_top = None;
+        let mut tray_top = None;
         let mut activity_error = None;
         let rows = if processes_needed && last_processes.elapsed() >= Duration::from_secs(2) {
             last_processes = Instant::now();
             let mut rows = processes.sample(system.logical_processors as u32, processes_visible);
-            if let Some(activity) = &mut activity {
-                let rates = activity.sample(
+            let rates = activity.as_mut().map(|activity| {
+                activity.sample(
                     rows.iter()
                         .filter_map(|row| row.times.map(|times| (row.pid, times.created))),
-                );
-                last_activity = Some(Instant::now());
-                disk_top = Some(rank_disk(
-                    rows.iter().filter_map(|row| {
-                        let rates = *rates.get(&(row.pid, row.times?.created))?;
-                        Some((row.pid, row.name.as_str(), rates))
-                    }),
-                    activity.disk_status(),
+                )
+            });
+            if let Some(metric) = hovered {
+                tray_top = Some((
+                    metric,
+                    rank_processes(
+                        rows.iter().map(|row| {
+                            let rates = row
+                                .times
+                                .and_then(|times| rates.as_ref()?.get(&(row.pid, times.created)))
+                                .copied()
+                                .unwrap_or_default();
+                            (
+                                row.pid,
+                                row.name.as_str(),
+                                metric.values(row.cpu, row.memory, rates),
+                            )
+                        }),
+                        processes
+                            .last_error
+                            .clone()
+                            .or_else(|| metric.activity_status(activity.as_ref())),
+                    ),
                 ));
-                if processes_visible {
-                    activity_error = activity.status();
-                }
+            }
+            if processes_visible {
+                activity_error = activity.as_ref().and_then(ActivityMonitor::status);
+            }
+            if let Some(rates) = rates {
                 for row in &mut rows {
                     if let Some(value) = row
                         .times
@@ -536,24 +634,28 @@ fn collect(shared: Arc<Shared>) {
         } else {
             None
         };
-        if disk_hovered
+        if let Some(metric) = hovered
+            && tray_top.is_none()
             && !processes_visible
-            && last_activity.is_none_or(|previous| previous.elapsed() >= Duration::from_secs(2))
-            && let Some(activity) = &mut activity
+            && last_tray_sample.is_none_or(|(previous, at)| {
+                previous != metric || at.elapsed() >= Duration::from_secs(2)
+            })
         {
-            last_activity = Some(Instant::now());
-            disk_top = Some(match processes.sample_names() {
-                Ok(names) => {
-                    let rates = activity.sample(names.iter().map(|(identity, _)| *identity));
-                    rank_disk(
-                        names.iter().filter_map(|(identity, name)| {
-                            Some((identity.0, name.as_str(), *rates.get(identity)?))
-                        }),
-                        activity.disk_status(),
-                    )
-                }
-                Err(_) => rank_disk([], Some("Не удалось получить список процессов".into())),
-            });
+            tray_top = Some((
+                metric,
+                compact_tray_top(
+                    &mut processes,
+                    metric,
+                    &mut compact_cpu,
+                    activity.as_mut(),
+                    system.logical_processors,
+                ),
+            ));
+        }
+        if let Some((metric, top)) = &tray_top {
+            last_tray_sample = Some((*metric, top.measured_at));
+        } else if hovered.is_none() {
+            last_tray_sample = None;
         }
         let mut data = shared
             .data
@@ -588,14 +690,21 @@ fn collect(shared: Arc<Shared>) {
             data.process_error = processes.last_error.clone();
             data.activity_error = activity_error;
         }
-        let disk_changed = if let Some(top) = disk_top {
-            data.disk_top = Some(Arc::new(top));
+        let tray_changed = if let Some((metric, top)) = tray_top {
+            data.tray_top = Some((metric, Arc::new(top)));
+            true
+        } else if data
+            .tray_top
+            .as_ref()
+            .is_some_and(|(metric, _)| Some(*metric) != hovered)
+        {
+            data.tray_top = None;
             true
         } else {
-            activity.is_none() && data.disk_top.take().is_some()
+            false
         };
         drop(data);
-        if system_changed || processes_changed || disk_changed {
+        if system_changed || processes_changed || tray_changed {
             shared.notifier.notify();
         }
         // A cheap 1s scheduling tick keeps process-rule latency <=2s independently
@@ -604,6 +713,59 @@ fn collect(shared: Arc<Shared>) {
             thread::sleep(remaining);
         }
     }
+}
+
+type CpuBaseline = (Instant, HashMap<u32, ProcessTimes>);
+
+fn compact_tray_top(
+    sampler: &mut ProcessSampler,
+    metric: TrayMetric,
+    cpu_baseline: &mut Option<CpuBaseline>,
+    mut activity: Option<&mut ActivityMonitor>,
+    logical_processors: usize,
+) -> ProcessTop {
+    let Ok(rows) = sampler.sample_usage() else {
+        *cpu_baseline = None;
+        return rank_processes([], Some("Не удалось получить список процессов".into()));
+    };
+    let sampled_at = Instant::now();
+    let rates = if metric.uses_activity() {
+        activity
+            .as_mut()
+            .map(|activity| activity.sample(rows.iter().map(|row| (row.pid, row.times.created))))
+    } else {
+        None
+    };
+    let top = rank_processes(
+        rows.iter().map(|row| {
+            let cpu = cpu_baseline.as_ref().and_then(|(previous_at, previous)| {
+                process_cpu(
+                    *previous.get(&row.pid)?,
+                    row.times,
+                    sampled_at.duration_since(*previous_at),
+                    logical_processors,
+                )
+            });
+            let rate = rates
+                .as_ref()
+                .and_then(|rates| rates.get(&(row.pid, row.times.created)))
+                .copied()
+                .unwrap_or_default();
+            (
+                row.pid,
+                row.name.as_str(),
+                metric.values(cpu, Some(row.memory), rate),
+            )
+        }),
+        metric.activity_status(activity.as_deref()),
+    );
+    if metric == TrayMetric::Cpu {
+        *cpu_baseline = Some((
+            sampled_at,
+            rows.into_iter().map(|row| (row.pid, row.times)).collect(),
+        ));
+    }
+    top
 }
 
 fn scan_startup(shared: &Shared, history: Option<&mut StartupHistory>) -> Arc<StartupSnapshot> {

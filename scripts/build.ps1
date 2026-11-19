@@ -49,5 +49,6 @@ try {
         }
     }
     Copy-Item -LiteralPath (Join-Path $projectRoot 'README.md') -Destination (Join-Path $distributionDirectory 'README.md') -Force
+    Copy-Item -LiteralPath (Join-Path $projectRoot 'LICENSE') -Destination (Join-Path $distributionDirectory 'LICENSE') -Force
     Write-Host ('Portable application: ' + (Join-Path $distributionDirectory 'AnVir-Next.exe'))
 } finally { Pop-Location }

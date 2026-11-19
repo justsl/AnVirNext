@@ -1,6 +1,6 @@
 use crate::{
     model::{format_bytes, format_percent, format_rate},
-    monitor::{Command, Shared, ViewSnapshot},
+    monitor::{Command, ProcessTop, Shared, TrayMetric, ViewSnapshot},
     sensors::{SensorState, cpu_temperature},
     settings::Settings,
     startup,
@@ -26,13 +26,13 @@ use windows_sys::{
 };
 
 pub const WM_TRAY: u32 = WM_APP + 3;
-pub(crate) const DISK_HOVER_TIMER: usize = 2;
-const DISK_ICON: usize = 4;
+pub(crate) const TRAY_HOVER_TIMER: usize = 2;
+const TEMPERATURE_ICON: usize = 0;
 const HOVER_DELAY: Duration = Duration::from_millis(425);
 
-#[path = "disk_tooltip.rs"]
-mod disk_tooltip;
-use disk_tooltip::DiskTooltip;
+#[path = "tray_tooltip.rs"]
+mod tray_tooltip;
+use tray_tooltip::TrayTooltip;
 pub enum TrayAction {
     Show,
     Exit,
@@ -75,13 +75,64 @@ struct LiveIcon {
     registered: bool,
 }
 
+#[derive(Clone, Copy)]
+struct Hover {
+    metric: TrayMetric,
+    index: usize,
+    anchor: RECT,
+    started: Instant,
+}
+
+#[derive(Debug, PartialEq)]
+enum HoverEvent {
+    Track {
+        metric: TrayMetric,
+        index: usize,
+        open: bool,
+    },
+    Close,
+    Ignore,
+}
+
+fn hover_event_kind(current: Option<TrayMetric>, event: LPARAM) -> HoverEvent {
+    let event = event as u32;
+    let message = event & 0xffff;
+    let index = (event >> 16).checked_sub(1).map(|index| index as usize);
+    let metric = index.and_then(TrayMetric::from_icon_index);
+    if matches!(message, WM_MOUSEMOVE | NIN_POPUPOPEN) {
+        return match (index, metric) {
+            (Some(index), Some(metric)) => HoverEvent::Track {
+                metric,
+                index,
+                open: message == NIN_POPUPOPEN,
+            },
+            _ => HoverEvent::Close,
+        };
+    }
+    let interaction = matches!(
+        message,
+        WM_LBUTTONDOWN
+            | WM_LBUTTONUP
+            | WM_LBUTTONDBLCLK
+            | WM_RBUTTONDOWN
+            | WM_RBUTTONUP
+            | WM_CONTEXTMENU
+            | NIN_SELECT
+    ) || message == (NIN_SELECT | NINF_KEY);
+    if interaction || current.is_some() && current == metric {
+        HoverEvent::Close
+    } else {
+        HoverEvent::Ignore
+    }
+}
+
 pub struct Tray {
     window: HWND,
     canvas: Canvas,
     icons: [Option<LiveIcon>; 5],
     force_render: bool,
-    disk_hover: Option<(RECT, Instant)>,
-    disk_tooltip: Option<DiskTooltip>,
+    hover: Option<Hover>,
+    tooltip: Option<TrayTooltip>,
     pub last_error: Option<String>,
 }
 
@@ -92,14 +143,14 @@ impl Tray {
             canvas: Canvas::new(icon_size())?,
             icons: std::array::from_fn(|_| None),
             force_render: true,
-            disk_hover: None,
-            disk_tooltip: None,
+            hover: None,
+            tooltip: None,
             last_error: None,
         })
     }
 
     pub fn recreate(&mut self) {
-        self.close_disk_tooltip();
+        self.close_tooltip();
         for icon in self.icons.iter_mut().flatten() {
             icon.registered = false;
         }
@@ -273,8 +324,9 @@ impl Tray {
             let adding = current.is_none_or(|icon| !icon.registered);
             let mut data = icon_data(self.window, index);
             data.uFlags |= NIF_ICON | NIF_MESSAGE;
-            if index != DISK_ICON {
-                data.uFlags |= NIF_TIP | NIF_SHOWTIP;
+            data.uFlags |= NIF_TIP;
+            if index == TEMPERATURE_ICON {
+                data.uFlags |= NIF_SHOWTIP;
             }
             data.uCallbackMessage = WM_TRAY;
             data.hIcon = image;
@@ -303,35 +355,38 @@ impl Tray {
                 icon.registered = true;
             }
         }
-        if let (Some(tooltip), Some((anchor, _))) = (&mut self.disk_tooltip, self.disk_hover) {
-            tooltip.update(anchor, disk_tooltip_text(snapshot));
+        if let (Some(tooltip), Some(hover)) = (&mut self.tooltip, self.hover) {
+            tooltip.update(hover.anchor, tooltip_text(hover.metric, snapshot));
         }
         self.force_render = false;
     }
 
-    pub(crate) fn disk_tooltip_open(&self) -> bool {
-        self.disk_tooltip.is_some()
+    pub(crate) fn hovered_metric(&self) -> Option<TrayMetric> {
+        self.hover.as_ref().map(|hover| hover.metric)
     }
 
-    pub(crate) fn disk_hover_event(&mut self, event: LPARAM, snapshot: &ViewSnapshot) {
-        let event = event as u32;
-        let message = event & 0xffff;
-        if (event >> 16) as usize != DISK_ICON + 1 {
-            if message == WM_MOUSEMOVE {
-                self.close_disk_tooltip();
+    pub(crate) fn hover_event(&mut self, event: LPARAM, snapshot: &ViewSnapshot) {
+        let (metric, index, open) = match hover_event_kind(self.hovered_metric(), event) {
+            HoverEvent::Track {
+                metric,
+                index,
+                open,
+            } => (metric, index, open),
+            HoverEvent::Close => {
+                self.close_tooltip();
+                return;
             }
-            return;
-        }
-        if !matches!(message, WM_MOUSEMOVE | NIN_POPUPOPEN) {
-            self.close_disk_tooltip();
-            return;
-        }
-        if self.disk_hover.is_none()
-            && self.icons[DISK_ICON]
+            HoverEvent::Ignore => return,
+        };
+        if self.hovered_metric() != Some(metric) {
+            self.close_tooltip();
+            if !self.icons[index]
                 .as_ref()
                 .is_some_and(|icon| icon.registered)
-        {
-            let data = icon_data(self.window, DISK_ICON);
+            {
+                return;
+            }
+            let data = icon_data(self.window, index);
             let identifier = NOTIFYICONIDENTIFIER {
                 cbSize: size_of::<NOTIFYICONIDENTIFIER>() as u32,
                 hWnd: self.window,
@@ -339,59 +394,70 @@ impl Tray {
                 guidItem: data.guidItem,
             };
             let mut anchor = RECT::default();
-            // SAFETY: identifier is the registered own icon; anchor is a writable RECT.
-            if unsafe { Shell_NotifyIconGetRect(&identifier, &mut anchor) } >= 0
-                && anchor.left < anchor.right
-                && anchor.top < anchor.bottom
+            // SAFETY: the identifier refers only to our registered icon and output is initialized.
+            if unsafe { Shell_NotifyIconGetRect(&identifier, &mut anchor) } < 0
+                || anchor.left >= anchor.right
+                || anchor.top >= anchor.bottom
             {
-                let started = Instant::now();
-                self.disk_hover = Some((anchor, started));
-                // Windows 11 may deliver mouse moves without popup notifications.
-                // The timer is armed only while this icon is under the pointer.
-                // SAFETY: the timer posts messages to the live own UI window.
-                if unsafe { SetTimer(self.window, DISK_HOVER_TIMER, 225, None) } == 0 {
-                    self.disk_hover = None;
-                }
+                return;
+            }
+            self.hover = Some(Hover {
+                metric,
+                index,
+                anchor,
+                started: Instant::now(),
+            });
+            // SAFETY: the one hover timer is owned by this tray window and is armed only under an icon.
+            if unsafe { SetTimer(self.window, TRAY_HOVER_TIMER, 225, None) } == 0 {
+                self.hover = None;
+                return;
             }
         }
-        if message == NIN_POPUPOPEN {
-            if let Some((_, started)) = &mut self.disk_hover {
-                *started = Instant::now() - HOVER_DELAY;
+        if open {
+            if let Some(hover) = &mut self.hover {
+                hover.started = Instant::now() - HOVER_DELAY;
             }
-            self.disk_hover_tick(snapshot);
+            self.hover_tick(snapshot);
         }
     }
 
-    pub(crate) fn disk_hover_tick(&mut self, snapshot: &ViewSnapshot) {
-        let Some((anchor, started)) = self.disk_hover else {
+    pub(crate) fn hover_tick(&mut self, snapshot: &ViewSnapshot) {
+        let Some(hover) = self.hover else {
             return;
         };
         let mut point = POINT::default();
-        // SAFETY: point is writable; anchor is our copied screen rectangle.
-        let inside = unsafe { GetCursorPos(&mut point) != 0 && PtInRect(&anchor, point) != 0 };
+        // SAFETY: writable point and our copied screen rectangle; popup never takes focus or pointer hits.
+        let inside =
+            unsafe { GetCursorPos(&mut point) != 0 && PtInRect(&hover.anchor, point) != 0 };
         if !inside {
-            self.close_disk_tooltip();
-        } else if self.disk_tooltip.is_none() && started.elapsed() >= HOVER_DELAY {
-            self.disk_tooltip = DiskTooltip::open(anchor, disk_tooltip_text(snapshot));
-            if self.disk_tooltip.is_none() {
-                self.close_disk_tooltip();
+            self.close_tooltip();
+            return;
+        }
+        if self.tooltip.is_none() && hover.started.elapsed() >= HOVER_DELAY {
+            self.tooltip = TrayTooltip::open(hover.anchor, tooltip_text(hover.metric, snapshot));
+            if self.tooltip.is_none() {
+                self.close_tooltip();
             }
         }
     }
 
-    pub(crate) fn close_disk_tooltip(&mut self) {
-        if self.disk_hover.take().is_some() {
-            // SAFETY: timer is owned by this tray's window and id.
+    pub(crate) fn close_tooltip(&mut self) {
+        if self.hover.take().is_some() {
+            // SAFETY: this is the sole hover timer owned by our tray window.
             unsafe {
-                KillTimer(self.window, DISK_HOVER_TIMER);
+                KillTimer(self.window, TRAY_HOVER_TIMER);
             }
         }
-        self.disk_tooltip = None;
+        self.tooltip = None;
     }
 
     fn remove(&mut self, index: usize) {
-        if index == DISK_ICON {
-            self.close_disk_tooltip();
+        if self
+            .hover
+            .as_ref()
+            .is_some_and(|hover| hover.index == index)
+        {
+            self.close_tooltip();
         }
         if self.icons[index].take().is_some() {
             let data = icon_data(self.window, index);
@@ -405,6 +471,7 @@ impl Tray {
     // HWND is an opaque OS handle, never a dereferenced Rust memory pointer.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn settings_menu(&mut self, window: HWND, shared: &Shared) -> Option<TrayAction> {
+        self.close_tooltip();
         let mut settings = shared.current_settings();
         // SAFETY: an empty native popup is returned to this caller for destruction.
         let menu = unsafe { CreatePopupMenu() };
@@ -572,12 +639,16 @@ fn color_pixel(color: [u8; 3]) -> u32 {
 }
 
 fn network_tooltip(system: &crate::metrics::SystemSample, fresh: bool) -> String {
-    let names: String = system
+    let mut names = system
         .network_adapters
-        .join(", ")
-        .chars()
-        .take(22)
-        .collect();
+        .iter()
+        .take(6)
+        .map(|name| clean_name(name, 80))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if system.network_adapters.len() > 6 {
+        let _ = write!(names, " · ещё {}", system.network_adapters.len() - 6);
+    }
     let names = if names.is_empty() {
         "Внешняя сеть"
     } else {
@@ -610,8 +681,7 @@ fn network_tooltip(system: &crate::metrics::SystemSample, fresh: bool) -> String
     )
 }
 
-fn disk_tooltip_text(snapshot: &ViewSnapshot) -> String {
-    let mut text = String::new();
+fn append_disk_summary(text: &mut String, snapshot: &ViewSnapshot) {
     let system = &snapshot.system;
     if snapshot.updated.elapsed() <= Duration::from_secs(10) {
         let _ = writeln!(
@@ -631,7 +701,7 @@ fn disk_tooltip_text(snapshot: &ViewSnapshot) -> String {
             let _ = writeln!(
                 text,
                 "Диск {} · {} · Ч {} · З {}",
-                disk.name,
+                clean_name(&disk.name, 64),
                 format_percent(disk.busy),
                 format_rate(disk.read),
                 format_rate(disk.write)
@@ -645,38 +715,47 @@ fn disk_tooltip_text(snapshot: &ViewSnapshot) -> String {
     } else {
         let _ = writeln!(text, "Диски · показания устарели");
     }
-    let Some(top) = snapshot
-        .disk_top
-        .as_ref()
-        .filter(|top| top.measured_at.elapsed() < Duration::from_secs(6))
-    else {
+}
+
+fn clean_name(name: &str, limit: usize) -> String {
+    name.chars()
+        .filter(|character| !character.is_control())
+        .take(limit)
+        .collect()
+}
+
+fn append_process_top(text: &mut String, metric: TrayMetric, top: Option<&ProcessTop>) {
+    let Some(top) = top.filter(|top| top.measured_at.elapsed() < Duration::from_secs(6)) else {
         text.push_str("\nСобираю статистику процессов…");
-        return text;
+        return;
     };
-    for (header, direction) in ["Лидеры чтения", "Лидеры записи"]
-        .into_iter()
-        .zip(&top.directions)
-    {
+    let headers: &[&str] = match metric {
+        TrayMetric::Cpu => &["Лидеры CPU"],
+        TrayMetric::Memory => &["Лидеры памяти · рабочий набор"],
+        TrayMetric::Network => &["Лидеры внешнего приёма", "Лидеры внешней передачи"],
+        TrayMetric::Disk => &["Лидеры чтения", "Лидеры записи"],
+    };
+    for (header, direction) in headers.iter().zip(&top.directions) {
         let _ = writeln!(text, "\n{header}");
         match direction {
             Some(rows) if !rows.is_empty() => {
-                for row in rows {
-                    let name: String = row
-                        .name
-                        .chars()
-                        .filter(|character| !character.is_control())
-                        .take(32)
-                        .collect();
-                    let _ = writeln!(
-                        text,
-                        "{name} ({}) · {}",
-                        row.pid,
-                        format_rate(Some(row.rate))
-                    );
+                for row in rows.iter().take(3) {
+                    let name = clean_name(&row.name, 40);
+                    let value = match metric {
+                        TrayMetric::Cpu => format_percent(Some(row.rate)),
+                        TrayMetric::Memory => format_bytes(row.rate),
+                        TrayMetric::Network | TrayMetric::Disk => format_rate(Some(row.rate)),
+                    };
+                    let _ = writeln!(text, "{name} ({}) · {}", row.pid, value);
                 }
             }
             Some(_) => {
-                let _ = writeln!(text, "Нет активности");
+                let idle = match metric {
+                    TrayMetric::Cpu => "Нет нагрузки",
+                    TrayMetric::Memory => "Нет потребления памяти",
+                    _ => "Нет активности",
+                };
+                let _ = writeln!(text, "{idle}");
             }
             None => {
                 let _ = writeln!(text, "—");
@@ -685,10 +764,59 @@ fn disk_tooltip_text(snapshot: &ViewSnapshot) -> String {
     }
     if let Some(status) = &top.status {
         let _ = write!(text, "\n{status}");
-    } else if top.directions.iter().all(Option::is_none) {
+    } else if top
+        .directions
+        .iter()
+        .take(headers.len())
+        .all(Option::is_none)
+    {
         text.push_str("\nСобираю статистику процессов…");
     }
-    text.trim_end().to_owned()
+}
+
+fn tooltip_text(metric: TrayMetric, snapshot: &ViewSnapshot) -> String {
+    let mut text = String::new();
+    let system = &snapshot.system;
+    let fresh = snapshot.updated.elapsed() <= Duration::from_secs(10);
+    match metric {
+        TrayMetric::Cpu => {
+            let _ = writeln!(
+                text,
+                "CPU: {}\n{} ядер · {} логических процессоров",
+                format_percent(system.cpu.filter(|_| fresh)),
+                system.physical_cores,
+                system.logical_processors
+            );
+        }
+        TrayMetric::Memory => {
+            let valid = fresh && system.memory_total > 0;
+            let used = if valid {
+                format_bytes(system.memory_used as f64)
+            } else {
+                "—".into()
+            };
+            let total = if valid {
+                format_bytes(system.memory_total as f64)
+            } else {
+                "—".into()
+            };
+            let _ = writeln!(
+                text,
+                "Память: {}\n{} из {}",
+                format_percent(system.memory_percent.filter(|_| fresh)),
+                used,
+                total
+            );
+        }
+        TrayMetric::Network => {
+            text.push_str(&network_tooltip(system, fresh));
+            text.push('\n');
+        }
+        TrayMetric::Disk => append_disk_summary(&mut text, snapshot),
+    }
+    append_process_top(&mut text, metric, snapshot.tray_process_top(metric));
+    text.truncate(text.trim_end().len());
+    text
 }
 
 fn bar_height(value: f64, maximum: f64, height: usize) -> usize {
@@ -961,6 +1089,146 @@ impl Drop for Canvas {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn top(
+        directions: [Option<Vec<crate::monitor::LeadingProcess>>; 2],
+        status: Option<&str>,
+    ) -> ProcessTop {
+        ProcessTop {
+            measured_at: Instant::now(),
+            directions,
+            status: status.map(str::to_owned),
+        }
+    }
+    fn leader(pid: u32, name: &str, rate: f64) -> crate::monitor::LeadingProcess {
+        crate::monitor::LeadingProcess {
+            pid,
+            name: name.into(),
+            rate,
+        }
+    }
+
+    #[test]
+    fn shared_hover_switches_metrics_ignores_old_close_and_closes_on_temperature_or_click() {
+        let event = |index: usize, message: u32| (((index as u32 + 1) << 16) | message) as LPARAM;
+        assert_eq!(
+            hover_event_kind(None, event(1, WM_MOUSEMOVE)),
+            HoverEvent::Track {
+                metric: TrayMetric::Cpu,
+                index: 1,
+                open: false
+            }
+        );
+        assert_eq!(
+            hover_event_kind(Some(TrayMetric::Cpu), event(2, NIN_POPUPOPEN)),
+            HoverEvent::Track {
+                metric: TrayMetric::Memory,
+                index: 2,
+                open: true
+            }
+        );
+        assert_eq!(
+            hover_event_kind(Some(TrayMetric::Memory), event(1, NIN_POPUPCLOSE)),
+            HoverEvent::Ignore
+        );
+        assert_eq!(
+            hover_event_kind(Some(TrayMetric::Memory), event(2, NIN_POPUPCLOSE)),
+            HoverEvent::Close
+        );
+        assert_eq!(
+            hover_event_kind(Some(TrayMetric::Network), event(0, WM_MOUSEMOVE)),
+            HoverEvent::Close
+        );
+        assert_eq!(
+            hover_event_kind(Some(TrayMetric::Network), event(0, NIN_SELECT | NINF_KEY)),
+            HoverEvent::Close
+        );
+        assert_eq!(
+            hover_event_kind(Some(TrayMetric::Disk), event(1, WM_CONTEXTMENU)),
+            HoverEvent::Close
+        );
+    }
+
+    #[test]
+    fn process_top_uses_metric_units_and_keeps_network_directions_separate() {
+        let cpu = top([Some(vec![leader(1, "CPU", 12.5)]), None], None);
+        let mut text = String::new();
+        append_process_top(&mut text, TrayMetric::Cpu, Some(&cpu));
+        assert!(text.contains("CPU (1) · 12.5%"));
+        assert!(!text.contains("Б/с"));
+        let memory = top([Some(vec![leader(2, "RAM", 1_073_741_824.0)]), None], None);
+        text.clear();
+        append_process_top(&mut text, TrayMetric::Memory, Some(&memory));
+        assert!(text.contains("RAM (2) · 1.0 ГиБ"));
+        assert!(!text.contains("/с"));
+        let network = top(
+            [
+                Some(vec![leader(3, "RX", 1024.0)]),
+                Some(vec![leader(4, "TX", 2048.0)]),
+            ],
+            None,
+        );
+        text.clear();
+        append_process_top(&mut text, TrayMetric::Network, Some(&network));
+        let receive = text.find("Лидеры внешнего приёма").unwrap();
+        let send = text.find("Лидеры внешней передачи").unwrap();
+        assert!(receive < text.find("RX (3) · 1.0 КиБ/с").unwrap());
+        assert!(text.find("RX (3)").unwrap() < send);
+        assert!(send < text.find("TX (4) · 2.0 КиБ/с").unwrap());
+    }
+
+    #[test]
+    fn process_top_distinguishes_loading_unavailable_idle_and_stale_without_fake_zeros() {
+        let mut text = String::new();
+        append_process_top(&mut text, TrayMetric::Disk, None);
+        assert!(text.contains("Собираю статистику"));
+        assert!(!text.contains("Нет активности"));
+        let unknown = top([None, None], Some("Недостаточно прав"));
+        text.clear();
+        append_process_top(&mut text, TrayMetric::Network, Some(&unknown));
+        assert!(text.contains("Недостаточно прав"));
+        assert!(!text.contains("Нет активности"));
+        assert!(!text.contains("Собираю"));
+        let idle = top([Some(Vec::new()), Some(Vec::new())], None);
+        text.clear();
+        append_process_top(&mut text, TrayMetric::Disk, Some(&idle));
+        assert_eq!(text.matches("Нет активности").count(), 2);
+        let stale = ProcessTop {
+            measured_at: Instant::now() - Duration::from_secs(8),
+            ..top([Some(vec![leader(2, "STALE", 1000.0)]), None], None)
+        };
+        text.clear();
+        append_process_top(&mut text, TrayMetric::Cpu, Some(&stale));
+        assert!(!text.contains("STALE"));
+        assert!(text.contains("Собираю"));
+    }
+
+    #[test]
+    fn popup_preserves_adapter_totals_link_and_memory_summary_while_hiding_stale_totals() {
+        let mut snapshot = ViewSnapshot::default();
+        snapshot.system.network_adapters =
+            vec!["Physical adapter with a long full display name".into()];
+        snapshot.system.network_received = Some(1024);
+        snapshot.system.network_sent = Some(2048);
+        snapshot.system.network_receive = Some(4096.0);
+        snapshot.system.network_send = Some(8192.0);
+        snapshot.system.network_link_speed = Some(1_000_000_000);
+        let text = tooltip_text(TrayMetric::Network, &snapshot);
+        assert!(text.contains("Physical adapter with a long full display name"));
+        assert!(text.contains("Получено: 1.0 КиБ"));
+        assert!(text.contains("Отправлено: 2.0 КиБ"));
+        assert!(text.contains("1000 Мбит/с"));
+        snapshot.system.memory_percent = Some(50.0);
+        snapshot.system.memory_used = 536_870_912;
+        snapshot.system.memory_total = 1_073_741_824;
+        let text = tooltip_text(TrayMetric::Memory, &snapshot);
+        assert!(text.contains("50.0%"));
+        assert!(text.contains("512.0 МиБ из 1.0 ГиБ"));
+        snapshot.updated = Instant::now() - Duration::from_secs(12);
+        let text = tooltip_text(TrayMetric::Memory, &snapshot);
+        assert!(text.contains("— из —"));
+        assert!(!text.contains("512.0"));
+    }
 
     #[test]
     fn native_cpu_icon_contains_both_core_columns_and_the_total_number() {

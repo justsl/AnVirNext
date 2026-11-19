@@ -43,6 +43,13 @@ mod startup_program;
 pub use startup_program::{StartupRuntimeOutcome, start_startup_program, stop_startup_program};
 pub type ProcessName = ((u32, u64), String);
 
+pub(crate) struct ProcessUsage {
+    pub pid: u32,
+    pub name: String,
+    pub times: ProcessTimes,
+    pub memory: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct ProcessRow {
     pub pid: u32,
@@ -106,6 +113,15 @@ struct NativeProcess {
     read_bytes: i64,
     write_bytes: i64,
     other_bytes: i64,
+}
+
+impl NativeProcess {
+    fn times(&self) -> ProcessTimes {
+        ProcessTimes {
+            created: self.created.max(0) as u64,
+            cpu: self.user.max(0) as u64 + self.kernel.max(0) as u64,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -214,17 +230,34 @@ pub struct ProcessSampler {
 impl ProcessSampler {
     /// One native snapshot; no per-process handles, metadata, icons or arguments.
     pub fn sample_names(&mut self) -> Result<Vec<ProcessName>, String> {
+        self.sample_compact(|pid, info, name| ((pid, info.created.max(0) as u64), name))
+    }
+
+    /// Values already available in the native snapshot, without opening each process.
+    pub(crate) fn sample_usage(&mut self) -> Result<Vec<ProcessUsage>, String> {
+        self.sample_compact(|pid, info, name| ProcessUsage {
+            pid,
+            name,
+            times: info.times(),
+            memory: info.working_set as u64,
+        })
+    }
+
+    fn sample_compact<T>(
+        &mut self,
+        mut row: impl FnMut(u32, &NativeProcess, String) -> T,
+    ) -> Result<Vec<T>, String> {
         let length = system_snapshot(&mut self.buffer)?;
-        let mut names = Vec::new();
+        let mut rows = Vec::new();
         let mut offset = 0;
         while let Some(info) = next_process(&self.buffer, length, &mut offset)? {
             let Ok(pid) = u32::try_from(info.pid as usize) else {
                 continue;
             };
             let name = snapshot_name(pid, info.image, self.buffer.as_ptr().cast(), length)?;
-            names.push(((pid, info.created.max(0) as u64), name));
+            rows.push(row(pid, &info, name));
         }
-        Ok(names)
+        Ok(rows)
     }
     /// Command-line access is opt-in; hidden rule-only sampling must pass false.
     pub fn sample(&mut self, logical: u32, include_arguments: bool) -> Vec<ProcessRow> {
@@ -254,10 +287,7 @@ impl ProcessSampler {
             let pid = info.pid as usize;
             if pid <= u32::MAX as usize {
                 let pid = pid as u32;
-                let times = ProcessTimes {
-                    created: info.created.max(0) as u64,
-                    cpu: info.user.max(0) as u64 + info.kernel.max(0) as u64,
-                };
+                let times = info.times();
                 let io =
                     (info.read_bytes.max(0) as u64).saturating_add(info.write_bytes.max(0) as u64);
                 let old = self
@@ -884,7 +914,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn name_snapshot_has_native_identity_and_keeps_metadata_caches_untouched() {
+    fn compact_snapshots_have_native_identity_and_keep_metadata_caches_untouched() {
         let mut sampler = ProcessSampler::default();
         let names = sampler.sample_names().unwrap();
         let ((pid, created), name) = names
@@ -894,6 +924,11 @@ mod tests {
         assert_eq!(*pid, std::process::id());
         assert!(*created > 0);
         assert!(!name.is_empty());
+        let usage = sampler.sample_usage().unwrap();
+        let process = usage.iter().find(|row| row.pid == *pid).unwrap();
+        assert_eq!(process.name, *name);
+        assert_eq!(process.times.created, *created);
+        assert!(process.memory > 0);
         assert!(sampler.identities.is_empty());
         assert!(sampler.arguments.entries.is_empty());
         assert!(sampler.versions.is_empty());

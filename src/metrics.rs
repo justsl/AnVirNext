@@ -6,12 +6,19 @@ use serde::Serialize;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     mem::{offset_of, size_of},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     ptr,
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{
     Foundation::FILETIME,
-    NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2, MIB_IF_TABLE2},
+    NetworkManagement::IpHelper::{
+        FreeMibTable, GetIfTable2, GetUnicastIpAddressTable, MIB_IF_TABLE2,
+        MIB_UNICASTIPADDRESS_ROW, MIB_UNICASTIPADDRESS_TABLE,
+    },
+    Networking::WinSock::{
+        AF_INET, AF_INET6, AF_UNSPEC, IpDadStateDeprecated, IpDadStatePreferred,
+    },
     System::{
         Performance::*,
         SystemInformation::{
@@ -158,6 +165,35 @@ impl Default for Metrics {
 }
 
 impl Metrics {
+    /// Called only for a requested Network hover, using the last selected physical LUID set.
+    pub(crate) fn physical_addresses(&self) -> Option<PhysicalAddresses> {
+        let interfaces = self.previous_network.as_ref()?;
+        if interfaces.is_empty() {
+            return Some(PhysicalAddresses::default());
+        }
+        let mut table: *mut MIB_UNICASTIPADDRESS_TABLE = ptr::null_mut();
+        // SAFETY: a read-only OS table query initializes this owned output allocation.
+        if unsafe { GetUnicastIpAddressTable(AF_UNSPEC, &mut table) } != 0 || table.is_null() {
+            return None;
+        }
+        // SAFETY: successful API returns the header and count contiguous rows; we cap the count before making a slice.
+        let result = unsafe {
+            let count = (*table).NumEntries as usize;
+            if count <= 4096 {
+                Some(physical_scope(
+                    std::slice::from_raw_parts((*table).Table.as_ptr(), count),
+                    interfaces,
+                ))
+            } else {
+                None
+            }
+        };
+        // SAFETY: this allocation came from GetUnicastIpAddressTable and is freed exactly once.
+        unsafe {
+            FreeMibTable(table.cast());
+        }
+        result
+    }
     pub fn sample(&mut self) -> SystemSample {
         let now = Instant::now();
         let elapsed = now.saturating_duration_since(self.previous_time);
@@ -243,6 +279,109 @@ fn external_interface(kind: u32, status: i32, flags: u8, tunnel: i32) -> bool {
 }
 
 type InterfaceCounters = HashMap<u64, (u64, u64)>;
+
+/// Address-based direct unicast scope, not wire/NIC-byte attribution.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PhysicalAddresses {
+    pub(crate) physical: HashSet<IpAddr>,
+    pub(crate) local: HashSet<IpAddr>,
+    pub(crate) broadcast: HashSet<IpAddr>,
+}
+
+pub(crate) fn canonical_address(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V6(value) => value.to_ipv4_mapped().map_or(address, IpAddr::V4),
+        _ => address,
+    }
+}
+
+impl PhysicalAddresses {
+    pub(crate) fn allows(&self, a: IpAddr, b: IpAddr) -> bool {
+        let a = canonical_address(a);
+        let b = canonical_address(b);
+        if !direct_unicast(a)
+            || !direct_unicast(b)
+            || self.broadcast.contains(&a)
+            || self.broadcast.contains(&b)
+        {
+            return false;
+        }
+        // Endpoint labels in classic UDP receive events vary. Exactly one endpoint
+        // must be an unambiguous physical local address; direction comes from opcode.
+        (self.physical.contains(&a) && !self.local.contains(&b))
+            || (self.physical.contains(&b) && !self.local.contains(&a))
+    }
+}
+
+fn direct_unicast(address: IpAddr) -> bool {
+    match canonical_address(address) {
+        IpAddr::V4(value) => {
+            !value.is_loopback()
+                && !value.is_multicast()
+                && value.octets()[0] != 0
+                && value.octets()[0] < 240
+        }
+        IpAddr::V6(value) => {
+            !value.is_unspecified()
+                && !value.is_loopback()
+                && !value.is_multicast()
+                && !value.is_unicast_link_local()
+        }
+    }
+}
+
+fn unicast_address(row: &MIB_UNICASTIPADDRESS_ROW) -> Option<IpAddr> {
+    // SAFETY: SOCKADDR_INET's documented family discriminates the initialized address union member.
+    unsafe {
+        match row.Address.si_family {
+            AF_INET => Some(IpAddr::V4(Ipv4Addr::from(
+                row.Address.Ipv4.sin_addr.S_un.S_addr.to_ne_bytes(),
+            ))),
+            AF_INET6 => Some(canonical_address(IpAddr::V6(Ipv6Addr::from(
+                row.Address.Ipv6.sin6_addr.u.Byte,
+            )))),
+            _ => None,
+        }
+    }
+}
+
+fn physical_scope(
+    rows: &[MIB_UNICASTIPADDRESS_ROW],
+    selected: &InterfaceCounters,
+) -> PhysicalAddresses {
+    let mut scope = PhysicalAddresses::default();
+    let mut excluded = HashSet::new();
+    for row in rows {
+        let Some(address) = unicast_address(row) else {
+            continue;
+        };
+        scope.local.insert(address);
+        // SAFETY: InterfaceLuid's Value is the native integral representation used by the selected counters.
+        let physical = selected.contains_key(&unsafe { row.InterfaceLuid.Value });
+        let usable = (row.DadState == IpDadStatePreferred || row.DadState == IpDadStateDeprecated)
+            && row.ValidLifetime != 0;
+        if !physical || !usable {
+            excluded.insert(address);
+            continue;
+        }
+        if !direct_unicast(address) {
+            continue;
+        }
+        scope.physical.insert(address);
+        if let IpAddr::V4(address) = address {
+            if row.OnLinkPrefixLength <= 30 {
+                let mask = u32::MAX
+                    .checked_shl(u32::from(32 - row.OnLinkPrefixLength))
+                    .unwrap_or(0);
+                scope
+                    .broadcast
+                    .insert(IpAddr::V4(Ipv4Addr::from(u32::from(address) | !mask)));
+            }
+        }
+    }
+    scope.physical.retain(|address| !excluded.contains(address));
+    scope
+}
 type LogicalLoads = BTreeMap<(u16, u8), f64>;
 
 struct NetworkSample {
@@ -603,6 +742,124 @@ impl Drop for PerformanceCounters {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_address_scope_excludes_local_virtual_loopback_and_nonunicast_peers() {
+        let physical: IpAddr = "192.0.2.10".parse().unwrap();
+        let virtual_ip: IpAddr = "10.8.0.2".parse().unwrap();
+        let remote: IpAddr = "198.51.100.20".parse().unwrap();
+        let broadcast: IpAddr = "192.0.2.255".parse().unwrap();
+        let scope = PhysicalAddresses {
+            physical: HashSet::from([physical]),
+            local: HashSet::from([physical, virtual_ip]),
+            broadcast: HashSet::from([broadcast]),
+        };
+        assert!(scope.allows(physical, remote));
+        assert!(scope.allows(remote, physical));
+        for peer in [
+            physical,
+            virtual_ip,
+            broadcast,
+            "127.0.0.1".parse().unwrap(),
+            "0.0.0.0".parse().unwrap(),
+            "224.0.0.1".parse().unwrap(),
+            "255.255.255.255".parse().unwrap(),
+        ] {
+            assert!(!scope.allows(physical, peer));
+        }
+        assert!(!scope.allows(virtual_ip, remote));
+        assert!(scope.allows(
+            "::ffff:192.0.2.10".parse().unwrap(),
+            "::ffff:198.51.100.20".parse().unwrap()
+        ));
+    }
+
+    fn address_row(address: &str, luid: u64) -> MIB_UNICASTIPADDRESS_ROW {
+        use windows_sys::Win32::Networking::WinSock::{
+            IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_INET,
+        };
+        let mut row = MIB_UNICASTIPADDRESS_ROW {
+            DadState: IpDadStatePreferred,
+            ValidLifetime: 3600,
+            ..MIB_UNICASTIPADDRESS_ROW::default()
+        };
+        row.InterfaceLuid.Value = luid;
+        row.Address = match address.parse::<IpAddr>().unwrap() {
+            IpAddr::V4(ip) => {
+                row.OnLinkPrefixLength = 24;
+                SOCKADDR_INET {
+                    Ipv4: SOCKADDR_IN {
+                        sin_family: AF_INET,
+                        sin_addr: IN_ADDR {
+                            S_un: IN_ADDR_0 {
+                                S_addr: u32::from_ne_bytes(ip.octets()),
+                            },
+                        },
+                        ..SOCKADDR_IN::default()
+                    },
+                }
+            }
+            IpAddr::V6(ip) => {
+                row.OnLinkPrefixLength = 64;
+                SOCKADDR_INET {
+                    Ipv6: SOCKADDR_IN6 {
+                        sin6_family: AF_INET6,
+                        sin6_addr: IN6_ADDR {
+                            u: IN6_ADDR_0 { Byte: ip.octets() },
+                        },
+                        ..SOCKADDR_IN6::default()
+                    },
+                }
+            }
+        };
+        row
+    }
+
+    #[test]
+    fn physical_scope_joins_selected_luids_and_rejects_ambiguous_and_tentative_addresses() {
+        let mut tentative = address_row("192.0.2.30", 1);
+        tentative.DadState = 1;
+        let rows = [
+            address_row("192.0.2.10", 1),
+            address_row("10.8.0.2", 2),
+            address_row("192.0.2.20", 1),
+            address_row("192.0.2.20", 2),
+            address_row("2001:db8::10", 1),
+            tentative,
+        ];
+        let scope = physical_scope(&rows, &HashMap::from([(1, (0, 0))]));
+        assert_eq!(
+            scope.physical,
+            HashSet::from([
+                "192.0.2.10".parse().unwrap(),
+                "2001:db8::10".parse().unwrap()
+            ])
+        );
+        assert_eq!(scope.local.len(), 5);
+        assert!(scope.broadcast.contains(&"192.0.2.255".parse().unwrap()));
+        assert!(!scope.allows("2001:db8::10".parse().unwrap(), "fe80::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn physical_addresses_native_read_only_smoke() {
+        let mut metrics = Metrics::default();
+        metrics.sample();
+        if let Some(scope) = metrics.physical_addresses() {
+            eprintln!(
+                "physical addresses: {} direct, {} host, {} broadcast exclusions",
+                scope.physical.len(),
+                scope.local.len(),
+                scope.broadcast.len()
+            );
+            assert!(scope.physical.is_subset(&scope.local));
+            assert!(
+                scope
+                    .physical
+                    .iter()
+                    .all(|&address| direct_unicast(address))
+            );
+        }
+    }
 
     #[test]
     fn physical_disks_merge_exact_instances_and_preserve_unavailable_values() {
