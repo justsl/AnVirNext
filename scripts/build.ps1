@@ -27,7 +27,7 @@ $cargoPath = if ($cargoCommand) { $cargoCommand.Source } else { Join-Path $env:U
 if (-not (Test-Path -LiteralPath $cargoPath)) { throw 'Rust is not installed. Install the stable x64 MSVC toolchain and Visual C++ Build Tools, then rerun this script.' }
 Push-Location $projectRoot
 try {
-    $cargoArguments = @('build')
+    $cargoArguments = @('build', '--locked')
     if ($Configuration -eq 'Release') { $cargoArguments += '--release' }
     & $cargoPath @cargoArguments
     if ($LASTEXITCODE -ne 0) { throw 'Rust build failed.' }

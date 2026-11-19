@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-2025
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      RUSTUP_TOOLCHAIN: stable-x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check source
+        run: |
+          rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --component rustfmt --component clippy
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo fmt --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy --locked --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\scripts\test-sensor-protocol.ps1
+
+      - name: Build portable distribution
+        run: .\scripts\build.ps1
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $package = .\scripts\package-release.ps1 -Tag $tag
+          $title = "AnVir Next $tag"
+          $existingJson = gh release view $tag --json isDraft,assets 2>$null
+          if ($LASTEXITCODE -ne 0) {
+              gh release create $tag $package.Archive --verify-tag --title $title --notes-file $package.Notes
+              exit $LASTEXITCODE
+          }
+
+          $existing = $existingJson | ConvertFrom-Json
+          if ($existing.isDraft) {
+              gh release upload $tag $package.Archive --clobber
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              gh release edit $tag --draft=false --title $title --notes-file $package.Notes
+              exit $LASTEXITCODE
+          }
+          if ($existing.assets.name -cnotcontains (Split-Path -Leaf $package.Archive)) {
+              throw "Release $tag already exists without the expected ZIP."
+          }
