@@ -59,6 +59,8 @@ git push origin v0.1.6
 
 GitHub Actions соберёт `dist\AnVir-Next`, упакует папку целиком и опубликует ZIP в Releases. Описание релиза формируется из коммитов после предыдущего тега версии.
 
+Сборку для существующего тега можно запустить в **Actions → Release → Run workflow**.
+
 ## Датчики
 
 Используется библиотека [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor), а не старый OpenHardwareMonitor из AnVir. Библиотека работает в отдельном процессе и передаёт только последние показания по локальному каналу. Полный интерфейс LibreHardwareMonitor для этого не запускается.

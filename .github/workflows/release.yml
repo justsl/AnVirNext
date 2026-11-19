@@ -3,13 +3,19 @@ name: Release
 on:
   push:
     tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -20,11 +26,19 @@ jobs:
       run:
         shell: pwsh
     env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
       RUSTUP_TOOLCHAIN: stable-x86_64-pc-windows-msvc
 
     steps:
+      - name: Validate release tag
+        run: |
+          if ($env:RELEASE_TAG -cnotmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+              throw 'Expected a version tag such as v0.1.5.'
+          }
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -47,7 +61,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = $env:GITHUB_REF_NAME
+          $tag = $env:RELEASE_TAG
           $package = .\scripts\package-release.ps1 -Tag $tag
           $title = "AnVir Next $tag"
           $existingJson = gh release view $tag --json isDraft,assets 2>$null
