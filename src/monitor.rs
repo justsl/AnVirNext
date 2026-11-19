@@ -21,6 +21,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+const FIRST_CPU_SAMPLE_DELAY: Duration = Duration::from_millis(250);
+const FIRST_ACTIVITY_SAMPLE_DELAY: Duration = Duration::from_millis(400);
+// A forced flush can miss its delivery deadline. Retry after the periodic ETW flush.
+const BUFFERED_ACTIVITY_SAMPLE_DELAY: Duration = Duration::from_millis(1100);
+
 #[derive(Clone)]
 pub struct ViewSnapshot {
     pub system: SystemSample,
@@ -109,6 +114,12 @@ pub(crate) struct ProcessTop {
     pub measured_at: Instant,
     pub directions: [Option<Vec<LeadingProcess>>; 2],
     pub status: Option<String>,
+}
+
+impl ProcessTop {
+    fn has_measurement(&self, metric: TrayMetric) -> bool {
+        self.directions[0].is_some() && (!metric.uses_activity() || self.directions[1].is_some())
+    }
 }
 
 fn rank_processes<'a>(
@@ -222,6 +233,75 @@ mod tests {
         assert!(!TrayMetric::Cpu.uses_activity());
         assert!(!TrayMetric::Memory.uses_activity());
         assert!(TrayMetric::Network.uses_activity() && TrayMetric::Disk.uses_activity());
+    }
+
+    #[test]
+    #[ignore = "Native ETW timing with an active physical adapter; requires administrator rights"]
+    fn first_tray_measurements_do_not_wait_for_regular_collection() {
+        use std::net::UdpSocket;
+
+        let local = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer_address = peer.local_addr().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("anvir-next-hover-{}", std::process::id()));
+        let shared = Shared::new(directory, Settings::default()).unwrap();
+        let boot = Instant::now();
+        while shared.snapshot().system.network_adapters.is_empty() && boot.elapsed().as_secs() < 4 {
+            thread::sleep(Duration::from_millis(15));
+        }
+        let measured = [
+            TrayMetric::Cpu,
+            TrayMetric::Memory,
+            TrayMetric::Network,
+            TrayMetric::Disk,
+        ]
+        .map(|metric| {
+            let started = Instant::now();
+            shared.set_tray_hover(Some(metric));
+            let mut disk_exercised = false;
+            let result = loop {
+                if metric == TrayMetric::Network {
+                    // Loopback confirms the ETW schema without using an external host.
+                    let _ = local.send_to(b"trace fixture", peer_address);
+                    let _ = peer.recv_from(&mut [0; 32]);
+                }
+                let snapshot = shared.snapshot();
+                let top = snapshot.tray_process_top(metric);
+                if metric == TrayMetric::Disk && top.is_some() && !disk_exercised {
+                    if let Err(error) = crate::activity::disk_fixture() {
+                        break Err(Some(error));
+                    }
+                    disk_exercised = true;
+                }
+                if top.is_some_and(|top| top.has_measurement(metric)) {
+                    break Ok(started.elapsed());
+                }
+                if started.elapsed() >= Duration::from_secs(5) {
+                    break Err(top.and_then(|top| top.status.clone()));
+                }
+                thread::sleep(Duration::from_millis(15));
+            };
+            eprintln!("First {metric:?} tray measurement: {result:?}");
+            shared.set_tray_hover(None);
+            let closed = Instant::now();
+            while shared.snapshot().tray_process_top(metric).is_some()
+                && closed.elapsed() < Duration::from_secs(3)
+            {
+                thread::sleep(Duration::from_millis(15));
+            }
+            (metric, result)
+        });
+        shared.shutdown();
+        shared.wait_for_shutdown();
+        for (metric, result) in measured {
+            let elapsed = result.expect("tray measurement unavailable");
+            assert!(
+                elapsed < Duration::from_millis(950),
+                "{metric:?}: {elapsed:?}"
+            );
+        }
     }
 }
 
@@ -461,11 +541,24 @@ impl Shared {
     }
 
     pub(crate) fn set_tray_hover(&self, metric: Option<TrayMetric>) {
-        self.tray_hover.store(
-            metric.map_or(0, |metric| metric as usize),
-            Ordering::Release,
-        );
+        let index = metric.map_or(0, |metric| metric as usize);
+        let previous = self.tray_hover.swap(index, Ordering::AcqRel);
+        if previous != index {
+            self.wake_collector();
+        }
     }
+
+    fn wake_collector(&self) {
+        if let Some(collector) = self
+            .collector
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+        {
+            collector.thread().unpark();
+        }
+    }
+
     pub fn saved_rules(&self) -> Vec<ProcessRule> {
         self.rules
             .lock()
@@ -479,6 +572,7 @@ impl Shared {
         self.stop.store(true, Ordering::Release);
         self.notifier.bind(std::ptr::null_mut());
         let _ = self.sender.try_send(Command::Stop);
+        self.wake_collector();
     }
 
     /// Called after the UI loop exits, so trace cleanup never blocks a window callback.
@@ -513,6 +607,8 @@ fn collect(shared: Arc<Shared>) {
     let mut processes = ProcessSampler::default();
     let mut activity: Option<ActivityMonitor> = None;
     let mut network_scope_requested = false;
+    let mut quick_sample_at = None::<Instant>;
+    let mut buffered_sample_at = None::<Instant>;
     let mut last_tray_sample = None::<(TrayMetric, Instant)>;
     let mut compact_cpu = None;
     let mut last_processes = Instant::now() - Duration::from_secs(3);
@@ -520,8 +616,13 @@ fn collect(shared: Arc<Shared>) {
     let mut system = SystemSample::default();
     let mut startup_dirty = true;
     let mut next_startup_scan = Instant::now();
+    let mut next_tick = Instant::now();
     while !shared.stop.load(Ordering::Acquire) {
         let started = Instant::now();
+        if started >= next_tick {
+            // Hover wakes do not postpone the periodic collector tick.
+            next_tick = started + Duration::from_secs(1);
+        }
         startup_dirty |= shared.startup_events.swap(false, Ordering::AcqRel);
         // Watch notifications cover Run/Startup and a periodic reconciliation
         // also captures tasks and services without a permanent COM/RPC poll.
@@ -546,31 +647,55 @@ fn collect(shared: Arc<Shared>) {
             .is_some_and(RuleBook::has_rules);
         let processes_visible = shared.visible.load(Ordering::Acquire)
             && shared.active_tab.load(Ordering::Relaxed) == 0;
-        let hovered = TrayMetric::from_icon_index(shared.tray_hover.load(Ordering::Acquire));
+        let hover_index = shared.tray_hover.load(Ordering::Acquire);
+        let hovered = TrayMetric::from_icon_index(hover_index);
+        let network_hover = hovered == Some(TrayMetric::Network);
+        let tray_opened =
+            hovered.is_some() && hovered != last_tray_sample.map(|(metric, _)| metric);
+        if tray_opened || hovered.is_none() {
+            quick_sample_at = None;
+            buffered_sample_at = None;
+        }
+        let quick_sample_due = quick_sample_at.is_some_and(|at| started >= at);
+        let buffered_sample_due = buffered_sample_at.is_some_and(|at| started >= at);
+        if quick_sample_due {
+            quick_sample_at = None;
+        }
+        if buffered_sample_due {
+            buffered_sample_at = None;
+        }
+        let sample_tray_now = tray_opened || quick_sample_due || buffered_sample_due;
         if hovered != Some(TrayMetric::Cpu) || processes_visible {
             compact_cpu = None;
         }
         if processes_visible || hovered.is_some_and(TrayMetric::uses_activity) {
             let activity = activity.get_or_insert_with(ActivityMonitor::new);
-            let wants_network_scope = hovered == Some(TrayMetric::Network);
-            if wants_network_scope != network_scope_requested
-                || (wants_network_scope && system_changed)
-            {
-                activity.set_network_scope(if wants_network_scope {
+            if network_hover != network_scope_requested || (network_hover && system_changed) {
+                activity.set_network_scope(if network_hover {
                     metrics.physical_addresses()
                 } else {
                     None
                 });
-                network_scope_requested = wants_network_scope;
+                network_scope_requested = network_hover;
             }
         } else {
             activity = None;
             network_scope_requested = false;
         }
+        if quick_sample_due
+            && !buffered_sample_due
+            && hovered.is_some_and(TrayMetric::uses_activity)
+            && let Some(activity) = &activity
+        {
+            activity.flush_for_tray();
+        }
         let processes_needed = processes_visible || has_rules;
         let mut tray_top = None;
         let mut activity_error = None;
-        let rows = if processes_needed && last_processes.elapsed() >= Duration::from_secs(2) {
+        let rows = if processes_needed
+            && (last_processes.elapsed() >= Duration::from_secs(2)
+                || (processes_visible && sample_tray_now))
+        {
             last_processes = Instant::now();
             let mut rows = processes.sample(system.logical_processors as u32, processes_visible);
             let rates = activity.as_mut().map(|activity| {
@@ -637,9 +762,10 @@ fn collect(shared: Arc<Shared>) {
         if let Some(metric) = hovered
             && tray_top.is_none()
             && !processes_visible
-            && last_tray_sample.is_none_or(|(previous, at)| {
-                previous != metric || at.elapsed() >= Duration::from_secs(2)
-            })
+            && (sample_tray_now
+                || last_tray_sample.is_none_or(|(previous, at)| {
+                    previous != metric || at.elapsed() >= Duration::from_secs(2)
+                }))
         {
             tray_top = Some((
                 metric,
@@ -654,6 +780,17 @@ fn collect(shared: Arc<Shared>) {
         }
         if let Some((metric, top)) = &tray_top {
             last_tray_sample = Some((*metric, top.measured_at));
+            if top.has_measurement(*metric) {
+                quick_sample_at = None;
+                buffered_sample_at = None;
+            } else if tray_opened {
+                if *metric == TrayMetric::Cpu {
+                    quick_sample_at = Some(top.measured_at + FIRST_CPU_SAMPLE_DELAY);
+                } else if metric.uses_activity() {
+                    quick_sample_at = Some(top.measured_at + FIRST_ACTIVITY_SAMPLE_DELAY);
+                    buffered_sample_at = Some(top.measured_at + BUFFERED_ACTIVITY_SAMPLE_DELAY);
+                }
+            }
         } else if hovered.is_none() {
             last_tray_sample = None;
         }
@@ -707,10 +844,15 @@ fn collect(shared: Arc<Shared>) {
         if system_changed || processes_changed || tray_changed {
             shared.notifier.notify();
         }
-        // A cheap 1s scheduling tick keeps process-rule latency <=2s independently
-        // of the user-selected interval for system metrics.
-        if let Some(remaining) = Duration::from_secs(1).checked_sub(started.elapsed()) {
-            thread::sleep(remaining);
+        let wake_at = quick_sample_at
+            .into_iter()
+            .chain(buffered_sample_at)
+            .fold(next_tick, Instant::min);
+        if let Some(remaining) = wake_at.checked_duration_since(Instant::now())
+            && shared.tray_hover.load(Ordering::Acquire) == hover_index
+            && !shared.stop.load(Ordering::Acquire)
+        {
+            thread::park_timeout(remaining);
         }
     }
 }

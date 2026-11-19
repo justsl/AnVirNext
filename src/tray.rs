@@ -28,7 +28,7 @@ use windows_sys::{
 pub const WM_TRAY: u32 = WM_APP + 3;
 pub(crate) const TRAY_HOVER_TIMER: usize = 2;
 const TEMPERATURE_ICON: usize = 0;
-const HOVER_DELAY: Duration = Duration::from_millis(425);
+const HOVER_DELAY: Duration = Duration::from_millis(300);
 
 #[path = "tray_tooltip.rs"]
 mod tray_tooltip;
@@ -408,7 +408,7 @@ impl Tray {
                 started: Instant::now(),
             });
             // SAFETY: the one hover timer is owned by this tray window and is armed only under an icon.
-            if unsafe { SetTimer(self.window, TRAY_HOVER_TIMER, 225, None) } == 0 {
+            if unsafe { SetTimer(self.window, TRAY_HOVER_TIMER, 150, None) } == 0 {
                 self.hover = None;
                 return;
             }

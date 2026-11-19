@@ -11,7 +11,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     ptr,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
@@ -39,6 +39,7 @@ const MAX_PROCESSES: usize = 8192;
 const MAX_THREADS: usize = 65536;
 const MAX_IRPS: usize = 32768;
 const IRP_TIMEOUT: u64 = 60 * 10_000_000;
+const TRAY_FLUSH_WAIT: Duration = Duration::from_millis(80);
 const TRACE_FLAGS: u32 = EVENT_TRACE_FLAG_NETWORK_TCPIP
     | EVENT_TRACE_FLAG_DISK_IO
     | EVENT_TRACE_FLAG_DISK_IO_INIT
@@ -310,6 +311,7 @@ struct Aggregate {
     external_issues: u64,
     diagnostic_pid: Option<u32>,
     endpoint_protocols: u8,
+    delivered_buffers: u64,
 }
 impl Aggregate {
     fn external_scope_ready(&self) -> bool {
@@ -761,6 +763,7 @@ struct Shared {
     done: AtomicBool,
     failure: Mutex<Option<String>>,
     reader: AtomicU64,
+    delivered: Condvar,
 }
 impl Default for Shared {
     fn default() -> Self {
@@ -771,10 +774,23 @@ impl Default for Shared {
             done: AtomicBool::new(false),
             failure: Mutex::new(None),
             reader: AtomicU64::new(u64::MAX),
+            delivered: Condvar::new(),
         }
     }
 }
 impl Shared {
+    fn wait_for_buffer(&self, after: u64) -> bool {
+        let Ok(aggregate) = self.aggregate.lock() else {
+            return false;
+        };
+        self.delivered
+            .wait_timeout_while(aggregate, TRAY_FLUSH_WAIT, |aggregate| {
+                aggregate.delivered_buffers == after
+                    && !self.stop.load(Ordering::Acquire)
+                    && !self.done.load(Ordering::Acquire)
+            })
+            .is_ok_and(|(aggregate, _)| aggregate.delivered_buffers != after)
+    }
     fn fail(&self, message: String) {
         if let Ok(mut failure) = self.failure.lock() {
             *failure = Some(message);
@@ -908,11 +924,14 @@ unsafe extern "system" fn buffer_callback(logfile: *mut EVENT_TRACE_LOGFILEW) ->
         }
         (logfile, &*logfile.Context.cast::<Shared>())
     };
-    if logfile.EventsLost > 0 {
-        if let Ok(mut aggregate) = shared.aggregate.lock() {
+    if let Ok(mut aggregate) = shared.aggregate.lock() {
+        if logfile.EventsLost > 0 {
             aggregate.note_loss(u64::from(logfile.EventsLost));
         }
+        // BufferCallback runs after that buffer's event callbacks have completed.
+        aggregate.delivered_buffers = aggregate.delivered_buffers.wrapping_add(1);
     }
+    shared.delivered.notify_all();
     u32::from(!shared.stop.load(Ordering::Acquire))
 }
 
@@ -924,6 +943,47 @@ struct Session {
     shared: Arc<Shared>,
 }
 impl Session {
+    fn flush_for_tray(&self) -> bool {
+        if self.shared.stop.load(Ordering::Acquire)
+            || self.shared.done.load(Ordering::Acquire)
+            || !self.shared.started.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        let mut properties = Properties::new();
+        // SAFETY: query only our unique GUID-bearing name, not a potentially reused opaque controller handle.
+        let result = unsafe {
+            ControlTraceW(
+                CONTROLTRACE_HANDLE::default(),
+                self.name.as_ptr(),
+                &mut properties.header,
+                EVENT_TRACE_CONTROL_QUERY,
+            )
+        };
+        if result != 0 || !same_guid(properties.header.Wnode.Guid, self.guid) {
+            return false;
+        }
+        let before = match self.shared.aggregate.lock() {
+            Ok(aggregate) => aggregate.delivered_buffers,
+            Err(_) => return false,
+        };
+        properties.header.Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+        properties.header.LogFileNameOffset = 0;
+        // SAFETY: exact validated private session name and owned writable properties; FLUSH does not change session configuration.
+        let result = unsafe {
+            ControlTraceW(
+                CONTROLTRACE_HANDLE::default(),
+                self.name.as_ptr(),
+                &mut properties.header,
+                EVENT_TRACE_CONTROL_FLUSH,
+            )
+        };
+        if result != 0 {
+            return false;
+        }
+        // Do not hold the aggregation mutex across ControlTrace. The bounded wait releases it to the reader.
+        self.shared.wait_for_buffer(before)
+    }
     fn start(shared: Arc<Shared>) -> Result<Self, String> {
         let mut guid = GUID::default();
         // SAFETY: CoCreateGuid requires no COM apartment and writes one GUID.
@@ -1136,6 +1196,15 @@ impl Default for ActivityMonitor {
     }
 }
 impl ActivityMonitor {
+    /// One-shot collector-side hover warm-up. Best effort; periodic ETW delivery remains the fallback.
+    /// Never call from UI callbacks or repeatedly for steady-state refreshes.
+    pub(crate) fn flush_for_tray(&self) {
+        if self.failure.is_none() {
+            if let Some(session) = &self.session {
+                let _ = session.flush_for_tray();
+            }
+        }
+    }
     pub fn new() -> Self {
         let shared = Arc::new(Shared::default());
         let (session, failure) = match Session::start(shared.clone()) {
@@ -1389,7 +1458,7 @@ impl ActivityMonitor {
     }
 }
 
-fn disk_fixture() -> Result<(), String> {
+pub(crate) fn disk_fixture() -> Result<(), String> {
     use std::{
         fs::OpenOptions,
         io::{Read, Seek, SeekFrom, Write},
@@ -1632,6 +1701,27 @@ pub fn diagnose_activity() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activity_tray_wait_observes_delivered_buffer_and_times_out_without_one() {
+        let shared = Arc::new(Shared::default());
+        let callback_shared = shared.clone();
+        let callback = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(5));
+            let mut logfile = EVENT_TRACE_LOGFILEW {
+                Context: Arc::as_ptr(&callback_shared).cast_mut().cast(),
+                ..EVENT_TRACE_LOGFILEW::default()
+            };
+            // SAFETY: synthetic logfile and its Arc context remain live for this actual callback invocation.
+            assert_eq!(unsafe { buffer_callback(&mut logfile) }, 1);
+        });
+        assert!(shared.wait_for_buffer(0));
+        callback.join().unwrap();
+        let delivered = shared.aggregate.lock().unwrap().delivered_buffers;
+        let start = Instant::now();
+        assert!(!shared.wait_for_buffer(delivered));
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
 
     fn net(pid: u32, bytes: u32, receive: bool) -> Event {
         Event::Network {
@@ -2113,6 +2203,67 @@ mod tests {
         // SAFETY: GetCurrentProcess is a borrowed query-capable pseudo handle.
         let birth = process_times(unsafe { GetCurrentProcess() }).unwrap().0;
         assert!(!owner_proven_dead((std::process::id(), birth)));
+    }
+
+    #[test]
+    #[ignore = "Explicit native ETW smoke; creates only our session, a temporary file and local sockets"]
+    fn activity_tray_flush_native_fixture() {
+        let mut monitor = ActivityMonitor::new();
+        if monitor.session.is_none() {
+            eprintln!("flush fixture unavailable: {:?}", monitor.failure);
+            assert!(
+                monitor
+                    .failure
+                    .as_ref()
+                    .is_some_and(|failure| failure.contains("run AnVir Next as administrator")),
+                "{:?}",
+                monitor.failure
+            );
+            return;
+        };
+        // SAFETY: borrowed current-process pseudo handle; read-only identity query.
+        let identity = (
+            std::process::id(),
+            process_times(unsafe { GetCurrentProcess() }).unwrap().0,
+        );
+        monitor.sample([identity]);
+        thread::sleep(Duration::from_millis(400));
+        let baseline_delivery = monitor.session.as_ref().unwrap().flush_for_tray();
+        monitor.sample([identity]);
+        let before = monitor
+            .shared
+            .aggregate
+            .lock()
+            .unwrap()
+            .counters(identity)
+            .unwrap();
+        let produced = Instant::now();
+        disk_fixture().unwrap();
+        network_fixture(false).unwrap();
+        let started = Instant::now();
+        monitor.flush_for_tray();
+        let flush_elapsed = started.elapsed();
+        let after = monitor
+            .shared
+            .aggregate
+            .lock()
+            .unwrap()
+            .counters(identity)
+            .unwrap();
+        eprintln!(
+            "tray flush native: baseline_delivery={baseline_delivery}, flush={flush_elapsed:?}, fixture_to_delivery={:?}, receive={}, send={}, read={}, write={}",
+            produced.elapsed(),
+            after.receive.saturating_sub(before.receive),
+            after.send.saturating_sub(before.send),
+            after.read.saturating_sub(before.read),
+            after.write.saturating_sub(before.write)
+        );
+        assert!(
+            after.receive > before.receive
+                && after.send > before.send
+                && after.read > before.read
+                && after.write > before.write
+        );
     }
 
     #[test]

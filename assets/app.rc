@@ -2,8 +2,8 @@
 1 24 "assets/app.manifest"
 
 1 VERSIONINFO
-FILEVERSION 0,1,4,0
-PRODUCTVERSION 0,1,4,0
+FILEVERSION 0,1,5,0
+PRODUCTVERSION 0,1,5,0
 FILEOS 0x40004
 FILETYPE 0x1
 BEGIN
@@ -12,11 +12,11 @@ BEGIN
     BLOCK "040904b0"
     BEGIN
       VALUE "FileDescription", "AnVir Next\0"
-      VALUE "FileVersion", "0.1.4\0"
+      VALUE "FileVersion", "0.1.5\0"
       VALUE "InternalName", "anvir-next\0"
       VALUE "OriginalFilename", "AnVir-Next.exe\0"
       VALUE "ProductName", "AnVir Next\0"
-      VALUE "ProductVersion", "0.1.4\0"
+      VALUE "ProductVersion", "0.1.5\0"
     END
   END
   BLOCK "VarFileInfo"
