@@ -1,5 +1,5 @@
 //! Source grouping and local timestamp formatting for the native startup view.
-use crate::startup::{StartupEntry, StartupOrigin};
+use crate::startup::{ExplorerDelay, StartupDelay, StartupEntry, StartupOrigin};
 use std::collections::{BTreeMap, BTreeSet};
 use windows_sys::Win32::{
     Foundation::{FILETIME, SYSTEMTIME},
@@ -29,6 +29,42 @@ pub fn format_added_at(value: Option<u64>) -> String {
         "{:02}.{:02}.{:04} {:02}:{:02}",
         local.wDay, local.wMonth, local.wYear, local.wHour, local.wMinute
     )
+}
+
+pub fn delay_cell(delay: &StartupDelay, explorer: Option<ExplorerDelay>) -> (String, Option<u64>) {
+    match delay {
+        StartupDelay::None => ("—".into(), None),
+        StartupDelay::Explorer => match explorer {
+            None => ("Windows: недоступно".into(), None),
+            Some(delay) => match delay.milliseconds {
+                None => ("Windows: по умолчанию".into(), None),
+                Some(milliseconds) => (
+                    if milliseconds % 1000 == 0 {
+                        format!("Windows: {} с", milliseconds / 1000)
+                    } else {
+                        format!("Windows: {milliseconds} мс")
+                    },
+                    Some(u64::from(milliseconds)),
+                ),
+            },
+        },
+        StartupDelay::Task { seconds, editable } => match seconds {
+            Some(0) => ("Задача: без задержки".into(), Some(0)),
+            Some(seconds) => (
+                format!("Задача: {seconds} с"),
+                Some(u64::from(*seconds) * 1000),
+            ),
+            None => (
+                if *editable {
+                    "Задача: разная/неизвестна"
+                } else {
+                    "Задача: недоступно"
+                }
+                .into(),
+                None,
+            ),
+        },
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -271,6 +307,7 @@ mod tests {
             icon_index: None,
             executable: None,
             added_at: None,
+            startup_delay: StartupDelay::None,
             origin,
         }
     }
@@ -364,5 +401,70 @@ mod tests {
         );
         assert!(epoch[11..13].parse::<u16>().is_ok_and(|hour| hour < 24));
         assert!(epoch[14..].parse::<u16>().is_ok_and(|minute| minute < 60));
+    }
+
+    #[test]
+    fn delay_cells_keep_shared_windows_scope_separate_from_tasks_and_unknown_values() {
+        assert_eq!(delay_cell(&StartupDelay::None, None), ("—".into(), None));
+        assert_eq!(
+            delay_cell(&StartupDelay::Explorer, None),
+            ("Windows: недоступно".into(), None)
+        );
+        assert_eq!(
+            delay_cell(&StartupDelay::Explorer, Some(ExplorerDelay::default())),
+            ("Windows: по умолчанию".into(), None)
+        );
+        assert_eq!(
+            delay_cell(
+                &StartupDelay::Explorer,
+                Some(ExplorerDelay {
+                    milliseconds: Some(1500),
+                    wait_for_idle: Some(1)
+                })
+            ),
+            ("Windows: 1500 мс".into(), Some(1500))
+        );
+        assert_eq!(
+            delay_cell(
+                &StartupDelay::Task {
+                    seconds: Some(0),
+                    editable: true
+                },
+                None
+            ),
+            ("Задача: без задержки".into(), Some(0))
+        );
+        assert_eq!(
+            delay_cell(
+                &StartupDelay::Task {
+                    seconds: Some(u32::MAX),
+                    editable: true
+                },
+                None
+            )
+            .1,
+            Some(u64::from(u32::MAX) * 1000)
+        );
+        assert!(
+            delay_cell(
+                &StartupDelay::Task {
+                    seconds: None,
+                    editable: true
+                },
+                None
+            )
+            .0
+            .contains("разная/неизвестна")
+        );
+        assert_eq!(
+            delay_cell(
+                &StartupDelay::Task {
+                    seconds: None,
+                    editable: false
+                },
+                None
+            ),
+            ("Задача: недоступно".into(), None)
+        );
     }
 }

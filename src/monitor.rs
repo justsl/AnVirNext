@@ -6,7 +6,7 @@ use crate::{
     processes::{self, ProcessDetails, ProcessRow, ProcessSampler, StartupRuntimeOutcome},
     sensors::{self, SensorState},
     settings::Settings,
-    startup::{self, StartupEntry, StartupHistory, StartupSnapshot},
+    startup::{self, ExplorerDelay, StartupEntry, StartupHistory, StartupSnapshot},
     win::Notifier,
 };
 use std::{
@@ -334,6 +334,7 @@ pub enum StartupAction {
     Disable,
     Start,
     Stop,
+    SetDelay(u32),
 }
 
 pub enum Command {
@@ -345,6 +346,10 @@ pub enum Command {
     StartupBatch {
         entries: Vec<StartupEntry>,
         action: StartupAction,
+    },
+    SetExplorerDelay {
+        expected: ExplorerDelay,
+        seconds: Option<u32>,
     },
     Scheduling {
         pid: u32,
@@ -926,6 +931,15 @@ fn scan_startup(shared: &Shared, history: Option<&mut StartupHistory>) -> Arc<St
     Arc::new(snapshot)
 }
 
+fn refresh_after_startup_change(shared: &Shared, history: Option<&mut StartupHistory>) {
+    let startup = scan_startup(shared, history);
+    shared
+        .status
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .startup = startup;
+}
+
 fn execute(shared: &Shared, command: Command, history: Option<&mut StartupHistory>) {
     let result: Result<Option<String>, String> = (|| match command {
         Command::SelectProcess { .. } => {
@@ -984,6 +998,9 @@ fn execute(shared: &Shared, command: Command, history: Option<&mut StartupHistor
                     StartupAction::Start | StartupAction::Stop => {
                         startup::set_running(entry, action == StartupAction::Start)
                     }
+                    StartupAction::SetDelay(seconds) => {
+                        startup::set_delay(entry, seconds).map(|()| StartupRuntimeOutcome::Applied)
+                    }
                 };
                 match result {
                     Ok(StartupRuntimeOutcome::Applied) => succeeded += 1,
@@ -996,13 +1013,11 @@ fn execute(shared: &Shared, command: Command, history: Option<&mut StartupHistor
                     }
                 }
             }
-            if matches!(action, StartupAction::Enable | StartupAction::Disable) {
-                let startup = scan_startup(shared, history);
-                shared
-                    .status
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .startup = startup;
+            if matches!(
+                action,
+                StartupAction::Enable | StartupAction::Disable | StartupAction::SetDelay(_)
+            ) {
+                refresh_after_startup_change(shared, history);
             }
             let already = if already_running > 0 {
                 format!(" Уже запущено: {already_running}.")
@@ -1023,8 +1038,22 @@ fn execute(shared: &Shared, command: Command, history: Option<&mut StartupHistor
                 }
                 StartupAction::Start => "Запуск запрошен",
                 StartupAction::Stop => "Остановлено",
+                StartupAction::SetDelay(_) => "Задержка обновлена",
             };
             Ok(Some(format!("{label}: {succeeded}.{already}")))
+        }
+        Command::SetExplorerDelay { expected, seconds } => {
+            let result = startup::set_explorer_delay(expected, seconds);
+            refresh_after_startup_change(shared, history);
+            result?;
+            let message = match seconds {
+                Some(0) => "Задержка и ожидание простоя Explorer отключены",
+                Some(_) => "Задержка запуска Explorer сохранена",
+                None => "Восстановлены системные параметры запуска Explorer",
+            };
+            Ok(Some(format!(
+                "{message}. Вступит в силу при следующем входе в Windows."
+            )))
         }
         Command::Scheduling {
             pid,

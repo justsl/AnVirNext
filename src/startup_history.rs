@@ -262,6 +262,7 @@ mod tests {
             icon_index: None,
             executable: None,
             added_at: None,
+            startup_delay: super::super::StartupDelay::None,
         }
     }
     fn run(name: &str) -> super::super::StartupEntry {
@@ -275,7 +276,7 @@ mod tests {
     fn snapshot(entries: Vec<super::super::StartupEntry>) -> StartupSnapshot {
         StartupSnapshot {
             entries,
-            warnings: Vec::new(),
+            ..StartupSnapshot::default()
         }
     }
 
@@ -356,6 +357,7 @@ mod tests {
         let mut incomplete = StartupSnapshot {
             entries: Vec::new(),
             warnings: vec!["access denied".into()],
+            ..StartupSnapshot::default()
         };
         assert_eq!(history.observe_at(&mut incomplete, 300).unwrap(), 0);
         let mut history = StartupHistory::load(fixture.0.clone()).unwrap();
@@ -422,6 +424,7 @@ mod tests {
         let mut unavailable = StartupSnapshot {
             entries: Vec::new(),
             warnings: vec!["unavailable".into()],
+            ..StartupSnapshot::default()
         };
         assert_eq!(history.observe_at(&mut unavailable, 100).unwrap(), 0);
         assert!(!fixture.0.exists());

@@ -7,10 +7,12 @@ use crate::{
     processes::{ProcessDetails, ProcessRow},
     scheduling_dialog,
     sensors::SensorState,
-    startup::{StartupEntry, StartupOrigin, StartupSnapshot},
+    startup::{StartupDelay, StartupEntry, StartupOrigin, StartupSnapshot},
     tray::{Tray, TrayAction},
     win::{WM_SAMPLE_UPDATED, wide},
 };
+#[path = "startup_delay_dialog.rs"]
+mod startup_delay_dialog;
 #[path = "startup_view.rs"]
 mod startup_view;
 use startup_view::Group;
@@ -67,6 +69,9 @@ const MENU_START: usize = 207;
 const MENU_STOP: usize = 208;
 const MENU_ENABLE: usize = 209;
 const MENU_DISABLE: usize = 210;
+const MENU_TASK_DELAY: usize = 211;
+const MENU_EXPLORER_DELAY: usize = 212;
+const MENU_OPEN_FOLDER: usize = 213;
 const STALE_AFTER: Duration = Duration::from_secs(10);
 const DETAILS_TIMEOUT: Duration = Duration::from_secs(5);
 const NIN_KEYSELECT_NOTIFICATION: u32 = NIN_SELECT | NINF_KEY;
@@ -85,6 +90,7 @@ struct Row {
     cells: Vec<String>,
     icon: Option<i32>,
     added_at: Option<u64>,
+    delay_milliseconds: Option<u64>,
 }
 
 struct Ui {
@@ -142,6 +148,12 @@ enum Effect {
     Popup(String, bool),
     Exit,
     Send(Command),
+    ExplorerDelay,
+    TaskDelay {
+        entries: Vec<StartupEntry>,
+        seconds: Option<u32>,
+        skipped: usize,
+    },
     Confirm {
         text: String,
         command: Command,
@@ -237,6 +249,10 @@ fn startup_supports(entry: &StartupEntry, action: StartupAction) -> bool {
                     StartupOrigin::Task { .. } | StartupOrigin::Service
                 )
         }
+        StartupAction::SetDelay(_) => matches!(
+            entry.startup_delay,
+            StartupDelay::Task { editable: true, .. }
+        ),
     }
 }
 
@@ -287,6 +303,7 @@ fn startup_batch_effect(entries: &[StartupEntry], action: StartupAction) -> Effe
         StartupAction::Disable => "Отключить автозагрузку",
         StartupAction::Start => "Запустить",
         StartupAction::Stop => "Остановить",
+        StartupAction::SetDelay(_) => "Изменить задержку запуска",
     };
     let warning = if action == StartupAction::Stop {
         "\r\nНесохранённые данные запущенных программ могут быть потеряны."
@@ -303,6 +320,33 @@ fn startup_batch_effect(entries: &[StartupEntry], action: StartupAction) -> Effe
             "{verb} для выбранных записей ({count})?\r\n\r\n{names}{more}{warning}{skipped}"
         ),
         command,
+    }
+}
+
+fn task_delay_effect(entries: &[StartupEntry]) -> Effect {
+    let eligible: Vec<_> = entries
+        .iter()
+        .filter(|entry| startup_supports(entry, StartupAction::SetDelay(0)))
+        .cloned()
+        .collect();
+    if eligible.is_empty() {
+        return Effect::None;
+    }
+    let mut values = eligible.iter().map(|entry| {
+        if let StartupDelay::Task { seconds, .. } = entry.startup_delay {
+            seconds
+        } else {
+            None
+        }
+    });
+    let seconds = values
+        .next()
+        .flatten()
+        .filter(|value| values.all(|other| other == Some(*value)));
+    Effect::TaskDelay {
+        skipped: entries.len() - eligible.len(),
+        entries: eligible,
+        seconds,
     }
 }
 
@@ -535,10 +579,10 @@ fn startup_targets(entries: &[StartupEntry], selected: &BTreeSet<String>) -> Vec
 }
 
 fn compare_startup_rows(a: &Row, b: &Row, column: usize) -> Compare {
-    if column == 5 {
-        a.added_at.cmp(&b.added_at)
-    } else {
-        a.cells.get(column).cmp(&b.cells.get(column))
+    match column {
+        5 => a.added_at.cmp(&b.added_at),
+        6 => a.delay_milliseconds.cmp(&b.delay_milliseconds),
+        _ => a.cells.get(column).cmp(&b.cells.get(column)),
     }
 }
 
@@ -615,6 +659,16 @@ fn target_effect(target: &MenuTarget, action: usize, details_edit: HWND) -> Effe
             _ => Effect::None,
         },
         MenuTarget::Startup(entries) => {
+            if action == MENU_TASK_DELAY {
+                return task_delay_effect(entries);
+            }
+            if action == MENU_EXPLORER_DELAY
+                && entries
+                    .iter()
+                    .any(|entry| matches!(entry.startup_delay, StartupDelay::Explorer))
+            {
+                return Effect::ExplorerDelay;
+            }
             let batch_action = match action {
                 MENU_ENABLE => Some(StartupAction::Enable),
                 MENU_DISABLE => Some(StartupAction::Disable),
@@ -630,7 +684,7 @@ fn target_effect(target: &MenuTarget, action: usize, details_edit: HWND) -> Effe
                 return Effect::None;
             };
             match action {
-                THIRD => entry
+                MENU_OPEN_FOLDER => entry
                     .executable
                     .as_ref()
                     .map(|path| Effect::OpenFolder(path.clone()))
@@ -703,6 +757,27 @@ unsafe fn track_context_menu(hwnd: HWND, point: POINT, target: &MenuTarget) -> O
                 let supports = |action| entries.iter().any(|entry| startup_supports(entry, action));
                 append(MENU_START, "Запустить", supports(StartupAction::Start));
                 append(MENU_STOP, "Остановить…", supports(StartupAction::Stop));
+                if supports(StartupAction::SetDelay(0)) {
+                    append(
+                        MENU_TASK_DELAY,
+                        if entries.len() == 1 {
+                            "Задержка запуска…"
+                        } else {
+                            "Задержка запуска задач…"
+                        },
+                        true,
+                    );
+                }
+                if entries
+                    .iter()
+                    .any(|entry| matches!(entry.startup_delay, StartupDelay::Explorer))
+                {
+                    append(
+                        MENU_EXPLORER_DELAY,
+                        "Общая задержка Windows (Run/папки)…",
+                        true,
+                    );
+                }
                 AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
                 append(
                     MENU_ENABLE,
@@ -720,7 +795,7 @@ unsafe fn track_context_menu(hwnd: HWND, point: POINT, target: &MenuTarget) -> O
                     None
                 };
                 append(
-                    THIRD,
+                    MENU_OPEN_FOLDER,
                     "Открыть папку файла",
                     entry.is_some_and(|entry| entry.executable.is_some()),
                 );
@@ -1216,6 +1291,7 @@ impl Ui {
                     ("Команда", 450, false),
                     ("Расположение", 400, false),
                     ("Когда добавлено", 150, false),
+                    ("Задержка", 205, false),
                 ],
                 2 => &[
                     ("Оборудование", 285, false),
@@ -1560,24 +1636,32 @@ impl Ui {
                             startup_view::matches_group(entry, &self.startup_group)
                                 && startup_view::matches_search(entry, &self.filter_text)
                         })
-                        .map(|entry| Row {
-                            key: Key::Entry(entry.id.clone()),
-                            icon: entry.icon_index,
-                            added_at: entry.added_at,
-                            cells: vec![
-                                entry.name.clone(),
-                                if entry.source.contains("status unknown") {
-                                    "Неизвестно".into()
-                                } else if entry.enabled {
-                                    "Включено".into()
-                                } else {
-                                    "Отключено".into()
-                                },
-                                entry.source.clone(),
-                                entry.command.clone(),
-                                entry.location.clone(),
-                                startup_view::format_added_at(entry.added_at),
-                            ],
+                        .map(|entry| {
+                            let (delay, delay_milliseconds) = startup_view::delay_cell(
+                                &entry.startup_delay,
+                                self.startup.explorer_delay,
+                            );
+                            Row {
+                                key: Key::Entry(entry.id.clone()),
+                                icon: entry.icon_index,
+                                added_at: entry.added_at,
+                                delay_milliseconds,
+                                cells: vec![
+                                    entry.name.clone(),
+                                    if entry.source.contains("status unknown") {
+                                        "Неизвестно".into()
+                                    } else if entry.enabled {
+                                        "Включено".into()
+                                    } else {
+                                        "Отключено".into()
+                                    },
+                                    entry.source.clone(),
+                                    entry.command.clone(),
+                                    entry.location.clone(),
+                                    startup_view::format_added_at(entry.added_at),
+                                    delay,
+                                ],
+                            }
                         })
                         .collect(),
                     2 => self
@@ -1591,6 +1675,7 @@ impl Ui {
                                     key: Key::Sensor(sensor.id.clone()),
                                     icon: None,
                                     added_at: None,
+                                    delay_milliseconds: None,
                                     cells: vec![
                                         sensor.hardware.clone(),
                                         sensor.name.clone(),
@@ -1608,6 +1693,7 @@ impl Ui {
                             key: Key::Rule(rule.executable.clone()),
                             icon: None,
                             added_at: None,
+                            delay_milliseconds: None,
                             cells: vec![
                                 rule.executable.clone(),
                                 scheduling_dialog::priority_name(rule.priority).into(),
@@ -1976,7 +2062,7 @@ impl Ui {
                 let details = if self.startup_selection.len() > 1 {
                     format!("Выбрано записей: {}. Действия «Запустить», «Остановить», «Включить» и «Отключить» доступны в контекстном меню. Delete отключает только включённые записи, допускающие изменение.", self.startup_selection.len())
                 } else {
-                self.selected_startup().map(|entry| format!("Команда:\r\n{}\r\n\r\nИсточник: {}\r\nРасположение: {}\r\nКогда добавлено: {}{}", entry.command, entry.source, entry.location, startup_view::format_added_at(entry.added_at),
+                self.selected_startup().map(|entry| format!("Команда:\r\n{}\r\n\r\nИсточник: {}\r\nРасположение: {}\r\nКогда добавлено: {}\r\nЗадержка: {}{}", entry.command, entry.source, entry.location, startup_view::format_added_at(entry.added_at), startup_view::delay_cell(&entry.startup_delay, self.startup.explorer_delay).0,
                     if entry.can_toggle { "" } else { "\r\nИзменение настройки автозагрузки недоступно. Запуск и остановка зависят от разрешений." })).unwrap_or_else(|| if self.len() == 0 && !self.status.startup_loading { "В выбранной группе нет записей, соответствующих фильтру. Автозагрузка RunOnce и служб доступна только для чтения.".into() } else { "Выберите запись автозагрузки. Настройки RunOnce и служб доступны только для чтения.".into() })
                 };
                 if warnings.is_empty() { details } else { format!("{details}\r\n\r\nПредупреждения сканирования:\r\n{warnings}") }
@@ -1998,7 +2084,7 @@ impl Ui {
         unsafe {
             let (primary, secondary, third) = match self.tab {
                 0 => ("Завершить…", "Приоритет / CPU…", "Открыть папку"),
-                1 => ("Обновить", "Отключить…", ""),
+                1 => ("Обновить", "Отключить…", "Запуск Windows…"),
                 2 => ("", "", ""),
                 _ => ("Удалить правило…", "", ""),
             };
@@ -2021,7 +2107,14 @@ impl Ui {
                 );
                 self.action_images
                     .apply_button(self.secondary, SIID_SETTINGS);
-                self.action_images.apply_button(self.third, SIID_FOLDEROPEN);
+                self.action_images.apply_button(
+                    self.third,
+                    if self.tab == 1 {
+                        SIID_SETTINGS
+                    } else {
+                        SIID_FOLDEROPEN
+                    },
+                );
                 self.buttons_tab = Some(self.tab);
             }
             let process = self.selected_details().is_some();
@@ -2045,7 +2138,14 @@ impl Ui {
                     })
                 } as i32,
             );
-            EnableWindow(self.third, process as i32);
+            EnableWindow(
+                self.third,
+                if self.tab == 1 {
+                    self.startup.explorer_delay.is_some()
+                } else {
+                    process
+                } as i32,
+            );
         }
     }
 
@@ -2281,8 +2381,11 @@ impl Ui {
             if id == SETTINGS {
                 return Effect::SettingsMenu;
             }
+            if self.tab == 1 && id == THIRD {
+                return Effect::ExplorerDelay;
+            }
             match (self.tab, id) {
-                (0, PRIMARY | SECONDARY | THIRD) | (1, SECONDARY | THIRD) => self
+                (0, PRIMARY | SECONDARY | THIRD) | (1, SECONDARY) => self
                     .menu_target()
                     .map(|target| target_effect(&target, id, self.details_edit))
                     .unwrap_or(Effect::None),
@@ -2320,6 +2423,61 @@ unsafe fn execute_effect(hwnd: HWND, shared: &Shared, effect: Effect) {
             Effect::Send(command) => {
                 if let Err(error) = shared.send(command) {
                     execute_effect(hwnd, shared, Effect::Error(error));
+                }
+            }
+            Effect::ExplorerDelay => {
+                let Some(expected) = shared.ui_status().startup.explorer_delay else {
+                    execute_effect(
+                        hwnd,
+                        shared,
+                        Effect::Error(
+                            "Общая задержка Windows не прочитана. Обновите автозагрузку.".into(),
+                        ),
+                    );
+                    return;
+                };
+                match startup_delay_dialog::show(
+                    hwnd,
+                    startup_delay_dialog::Mode::Explorer(expected),
+                ) {
+                    Ok(Some(choice)) => {
+                        let seconds = match choice {
+                            startup_delay_dialog::Choice::Seconds(value) => Some(value),
+                            startup_delay_dialog::Choice::WindowsDefaults => None,
+                        };
+                        execute_effect(
+                            hwnd,
+                            shared,
+                            Effect::Send(Command::SetExplorerDelay { expected, seconds }),
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(error) => execute_effect(hwnd, shared, Effect::Error(error)),
+                }
+            }
+            Effect::TaskDelay {
+                entries,
+                seconds,
+                skipped,
+            } => {
+                match startup_delay_dialog::show(
+                    hwnd,
+                    startup_delay_dialog::Mode::Tasks {
+                        count: entries.len(),
+                        seconds,
+                        skipped,
+                    },
+                ) {
+                    Ok(Some(startup_delay_dialog::Choice::Seconds(seconds))) => execute_effect(
+                        hwnd,
+                        shared,
+                        Effect::Send(Command::StartupBatch {
+                            entries,
+                            action: StartupAction::SetDelay(seconds),
+                        }),
+                    ),
+                    Ok(_) => {}
+                    Err(error) => execute_effect(hwnd, shared, Effect::Error(error)),
                 }
             }
             Effect::SettingsMenu => {
@@ -2933,6 +3091,7 @@ mod tests {
             icon_index: None,
             executable: None,
             added_at: None,
+            startup_delay: StartupDelay::None,
             origin: StartupOrigin::Registry {
                 machine: false,
                 view32: false,
@@ -3265,6 +3424,7 @@ mod tests {
             cells: Vec::new(),
             icon: None,
             added_at: None,
+            delay_milliseconds: None,
         };
         let reordered = [make_row("b"), make_row("c"), make_row("a")];
         assert_eq!(
@@ -3315,6 +3475,7 @@ mod tests {
             ],
             icon: None,
             added_at: Some(100),
+            delay_milliseconds: None,
         };
         let newer = Row {
             key: Key::Entry("new".into()),
@@ -3328,8 +3489,111 @@ mod tests {
             ],
             icon: None,
             added_at: Some(200),
+            delay_milliseconds: None,
         };
         assert_eq!(compare_startup_rows(&older, &newer, 5), Compare::Less);
         assert!(older.cells[5] > newer.cells[5]);
+    }
+
+    #[test]
+    fn task_delay_dialog_targets_only_editable_tasks_and_keeps_mixed_values_explicit() {
+        let mut first = startup_entry("first", true, true);
+        first.origin = StartupOrigin::Task {
+            folder: "\\".into(),
+        };
+        first.startup_delay = StartupDelay::Task {
+            seconds: Some(5),
+            editable: true,
+        };
+        let mut second = startup_entry("second", false, true);
+        second.origin = StartupOrigin::Task {
+            folder: "\\".into(),
+        };
+        second.startup_delay = StartupDelay::Task {
+            seconds: Some(5),
+            editable: true,
+        };
+        let mut readonly = startup_entry("readonly", true, false);
+        readonly.origin = StartupOrigin::Task {
+            folder: "\\".into(),
+        };
+        readonly.startup_delay = StartupDelay::Task {
+            seconds: Some(5),
+            editable: false,
+        };
+        let mut explorer = startup_entry("explorer", true, true);
+        explorer.startup_delay = StartupDelay::Explorer;
+        match task_delay_effect(&[first.clone(), readonly, explorer.clone(), second.clone()]) {
+            Effect::TaskDelay {
+                entries,
+                seconds,
+                skipped,
+            } => {
+                assert_eq!(
+                    entries
+                        .iter()
+                        .map(|entry| entry.id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["first", "second"]
+                );
+                assert_eq!(seconds, Some(5));
+                assert_eq!(skipped, 2);
+            }
+            _ => panic!("editable task selection must open the scoped editor"),
+        }
+        second.startup_delay = StartupDelay::Task {
+            seconds: None,
+            editable: true,
+        };
+        assert!(matches!(
+            task_delay_effect(&[first.clone(), second]),
+            Effect::TaskDelay { seconds: None, .. }
+        ));
+        first.startup_delay = StartupDelay::Task {
+            seconds: Some(0),
+            editable: true,
+        };
+        assert!(matches!(
+            task_delay_effect(&[first]),
+            Effect::TaskDelay {
+                seconds: Some(0),
+                ..
+            }
+        ));
+        assert!(matches!(
+            task_delay_effect(&[explorer.clone()]),
+            Effect::None
+        ));
+        assert!(matches!(
+            target_effect(
+                &MenuTarget::Startup(vec![explorer]),
+                MENU_EXPLORER_DELAY,
+                ptr::null_mut()
+            ),
+            Effect::ExplorerDelay
+        ));
+    }
+
+    #[test]
+    fn configured_delay_sort_compares_common_millisecond_units_not_source_labels() {
+        let row = |id: &str, milliseconds| Row {
+            key: Key::Entry(id.into()),
+            cells: Vec::new(),
+            icon: None,
+            added_at: None,
+            delay_milliseconds: milliseconds,
+        };
+        assert_eq!(
+            compare_startup_rows(
+                &row("task10sec", Some(10000)),
+                &row("windows1500ms", Some(1500)),
+                6
+            ),
+            Compare::Greater
+        );
+        assert_eq!(
+            compare_startup_rows(&row("task0", Some(0)), &row("windows1500ms", Some(1500)), 6),
+            Compare::Less
+        );
     }
 }

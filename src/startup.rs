@@ -42,6 +42,9 @@ mod tasks;
 pub use history::StartupHistory;
 
 const CURRENT_VERSION: &str = r"Software\Microsoft\Windows\CurrentVersion";
+const EXPLORER_SERIALIZE: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\Serialize";
+const EXPLORER_DELAY_VALUE: &str = "StartupDelayInMSec";
+const EXPLORER_IDLE_VALUE: &str = "WaitforIdleState";
 const MAX_VALUE_BYTES: usize = 64 * 1024;
 const MAX_ENTRIES: usize = 8192;
 const MAX_WARNINGS: usize = 128;
@@ -64,6 +67,23 @@ pub enum StartupOrigin {
     Service,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum StartupDelay {
+    #[default]
+    None,
+    Explorer,
+    Task {
+        seconds: Option<u32>,
+        editable: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExplorerDelay {
+    pub milliseconds: Option<u32>,
+    pub wait_for_idle: Option<u32>,
+}
+
 #[derive(Clone, Debug)]
 pub struct StartupEntry {
     pub id: String,
@@ -76,6 +96,7 @@ pub struct StartupEntry {
     pub icon_index: Option<i32>,
     pub executable: Option<String>,
     pub origin: StartupOrigin,
+    pub(crate) startup_delay: StartupDelay,
     /// First observed after this installation's baseline, in UTC Windows FILETIME ticks.
     /// Existing baseline entries have no known addition date.
     pub added_at: Option<u64>,
@@ -85,6 +106,7 @@ pub struct StartupEntry {
 pub struct StartupSnapshot {
     pub entries: Vec<StartupEntry>,
     pub warnings: Vec<String>,
+    pub explorer_delay: Option<ExplorerDelay>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -439,6 +461,134 @@ fn read_value(key: &Key, name: &str) -> Result<Option<(u32, Vec<u8>)>, String> {
     Err("Startup value is changing; refresh and retry".into())
 }
 
+fn read_explorer_dword(key: &Key, name: &str) -> Result<Option<u32>, String> {
+    read_value(key, name)?
+        .map(|(kind, bytes)| match (kind, <[u8; 4]>::try_from(bytes)) {
+            (REG_DWORD, Ok(value)) => Ok(u32::from_le_bytes(value)),
+            _ => Err(format!(
+                "Настройка Explorer {name} имеет неверный тип или размер"
+            )),
+        })
+        .transpose()
+}
+
+fn read_explorer_delay_values(key: &Key) -> Result<ExplorerDelay, String> {
+    Ok(ExplorerDelay {
+        milliseconds: read_explorer_dword(key, EXPLORER_DELAY_VALUE)?,
+        wait_for_idle: read_explorer_dword(key, EXPLORER_IDLE_VALUE)?,
+    })
+}
+
+fn read_explorer_delay() -> Result<ExplorerDelay, String> {
+    match open_key(false, EXPLORER_SERIALIZE, false, KEY_QUERY_VALUE)? {
+        Some(key) => read_explorer_delay_values(&key),
+        None => Ok(ExplorerDelay::default()),
+    }
+}
+
+fn change_explorer_dword(
+    key: &Key,
+    name: &str,
+    expected: Option<u32>,
+    desired: Option<u32>,
+) -> Result<(), String> {
+    if read_explorer_dword(key, name)? != expected {
+        return Err("Параметры запуска Explorer изменились, обновите список".into());
+    }
+    if expected == desired {
+        return Ok(());
+    }
+    let name = wide(name);
+    // SAFETY: writable owned HKCU key and UTF-16 name; the DWORD buffer lives for the synchronous call.
+    let result = unsafe {
+        if let Some(value) = desired {
+            RegSetValueExW(
+                key.0,
+                name.as_ptr(),
+                0,
+                REG_DWORD,
+                value.to_le_bytes().as_ptr(),
+                4,
+            )
+        } else {
+            RegDeleteValueW(key.0, name.as_ptr())
+        }
+    };
+    if result != 0 && !(desired.is_none() && result == ERROR_FILE_NOT_FOUND) {
+        return Err(win_error("Изменение задержки Explorer", result));
+    }
+    Ok(())
+}
+
+fn update_explorer_delay(
+    key: &Key,
+    expected: ExplorerDelay,
+    desired: ExplorerDelay,
+) -> Result<(), String> {
+    if read_explorer_delay_values(key)? != expected {
+        return Err("Параметры запуска Explorer изменились, обновите список".into());
+    }
+    change_explorer_dword(
+        key,
+        EXPLORER_DELAY_VALUE,
+        expected.milliseconds,
+        desired.milliseconds,
+    )?;
+    if let Err(error) = change_explorer_dword(
+        key,
+        EXPLORER_IDLE_VALUE,
+        expected.wait_for_idle,
+        desired.wait_for_idle,
+    ) {
+        if expected.milliseconds != desired.milliseconds
+            && let Err(rollback) = change_explorer_dword(
+                key,
+                EXPLORER_DELAY_VALUE,
+                desired.milliseconds,
+                expected.milliseconds,
+            )
+        {
+            return Err(format!(
+                "{error}\r\nНе удалось восстановить задержку. {rollback}"
+            ));
+        }
+        return Err(error);
+    }
+    if read_explorer_delay_values(key)? != desired {
+        return Err("Параметры запуска Explorer изменились, обновите список".into());
+    }
+    Ok(())
+}
+
+/// Configures how Explorer processes Run and Startup for the current account.
+pub fn set_explorer_delay(expected: ExplorerDelay, seconds: Option<u32>) -> Result<(), String> {
+    let desired = if let Some(seconds) = seconds {
+        ExplorerDelay {
+            milliseconds: Some(
+                seconds
+                    .checked_mul(1000)
+                    .ok_or("Задержка Explorer слишком велика")?,
+            ),
+            wait_for_idle: Some(0),
+        }
+    } else {
+        ExplorerDelay::default()
+    };
+    let _guard = MUTATION_LOCK
+        .lock()
+        .map_err(|_| "Не удалось заблокировать изменение автозагрузки")?;
+    let access = KEY_QUERY_VALUE | KEY_SET_VALUE;
+    let key = match open_key(false, EXPLORER_SERIALIZE, false, access)? {
+        Some(key) => key,
+        None if expected != ExplorerDelay::default() => {
+            return Err("Параметры запуска Explorer изменились, обновите список".into());
+        }
+        None if desired == expected => return Ok(()),
+        None => create_key(false, EXPLORER_SERIALIZE, access)?,
+    };
+    update_explorer_delay(&key, expected, desired)
+}
+
 fn registry_text(kind: u32, data: &[u8]) -> Result<String, String> {
     if !matches!(kind, REG_SZ | REG_EXPAND_SZ) || data.len() % 2 != 0 {
         return Err("Startup command is not a valid registry string".into());
@@ -572,6 +722,11 @@ fn run_program_entry(
             command,
             enabled,
             can_toggle,
+            startup_delay: if once {
+                StartupDelay::None
+            } else {
+                StartupDelay::Explorer
+            },
         },
     }))
 }
@@ -725,6 +880,7 @@ fn folder_program_entry(
             command,
             enabled,
             can_toggle,
+            startup_delay: StartupDelay::Explorer,
         },
     })
 }
@@ -776,7 +932,10 @@ fn scan_folders(snapshot: &mut StartupSnapshot) {
 
 /// Full on-demand inventory. Tasks and services are intentionally never polled by the watcher.
 pub fn scan() -> StartupSnapshot {
-    let mut snapshot = StartupSnapshot::default();
+    let mut snapshot = StartupSnapshot {
+        explorer_delay: read_explorer_delay().ok(),
+        ..StartupSnapshot::default()
+    };
     scan_registry(&mut snapshot);
     match tasks::ComScope::new() {
         Ok(_com) => {
@@ -912,6 +1071,17 @@ pub fn set_enabled(entry: &StartupEntry, enabled: bool) -> Result<(), String> {
             Err("Services are inventory-only; use Windows Services to change startup type".into())
         }
     }
+}
+
+/// Changes only delays of eligible startup triggers on an existing task.
+pub fn set_delay(entry: &StartupEntry, seconds: u32) -> Result<(), String> {
+    let _guard = MUTATION_LOCK
+        .lock()
+        .map_err(|_| "Не удалось заблокировать изменение автозагрузки")?;
+    if let Identity::Task { path, .. } = parse_id(&entry.id)? {
+        return tasks::set_task_delay(entry, &path, seconds);
+    }
+    Err("У этой записи нет собственной задержки Планировщика".into())
 }
 
 fn self_command() -> Result<String, String> {
@@ -1071,6 +1241,7 @@ fn service_entry(
         command,
         enabled: true,
         can_toggle: false,
+        startup_delay: StartupDelay::None,
     }))
 }
 
@@ -1484,6 +1655,7 @@ mod tests {
                 view32: false,
                 once: false,
             },
+            startup_delay: StartupDelay::Explorer,
         }
     }
 
@@ -1641,6 +1813,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn explorer_delay_is_reversible_and_rejects_stale_or_malformed_values() {
+        let fixture = FixtureKey::new();
+        fixture.put("Unrelated", REG_BINARY, &[42]);
+        let default = ExplorerDelay::default();
+        let fast = ExplorerDelay {
+            milliseconds: Some(0),
+            wait_for_idle: Some(0),
+        };
+        assert_eq!(read_explorer_delay_values(fixture.key()).unwrap(), default);
+        update_explorer_delay(fixture.key(), default, fast).unwrap();
+        assert_eq!(read_explorer_delay_values(fixture.key()).unwrap(), fast);
+        assert!(update_explorer_delay(fixture.key(), default, fast).is_err());
+        update_explorer_delay(fixture.key(), fast, default).unwrap();
+        assert_eq!(read_explorer_delay_values(fixture.key()).unwrap(), default);
+        assert_eq!(
+            read_value(fixture.key(), "Unrelated").unwrap(),
+            Some((REG_BINARY, vec![42]))
+        );
+        fixture.put(EXPLORER_IDLE_VALUE, REG_BINARY, &[1]);
+        assert!(update_explorer_delay(fixture.key(), default, fast).is_err());
+        assert_eq!(
+            read_value(fixture.key(), EXPLORER_DELAY_VALUE).unwrap(),
+            None
+        );
     }
 
     #[test]
